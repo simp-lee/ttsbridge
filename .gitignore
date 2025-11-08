@@ -1,0 +1,54 @@
+# Binaries
+*.exe
+*.exe~
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files
+*.mp3
+*.wav
+*.ogg
+*.opus
+*.flac
+
+# Cache
+cache/
+.cache/
+
+# Config files (keep example)
+config.yaml
+config.json
+!config.example.yaml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+docs/
+bin/
+*.zip
