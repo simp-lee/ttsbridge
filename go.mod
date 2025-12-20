@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/gorilla/websocket v1.5.3
+	github.com/simp-lee/retry v0.0.0-20250318140515-d61f8656845c
 	github.com/u2takey/ffmpeg-go v0.5.0
 )
 

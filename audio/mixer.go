@@ -15,10 +15,12 @@ import (
 )
 
 // MixWithBackgroundMusic 将背景音乐混合到语音音频中
-// voiceAudio: 语音音频数据（MP3 格式）
+// voiceAudio: 语音音频数据（支持 MP3/WAV 等格式,ffmpeg 会自动识别）
+// providerName: TTS 提供商名称，用于确定语音质量
+// voiceID: TTS voice 标识，便于解析语音音质
 // opts: 背景音乐选项
-// 返回混音后的音频数据（MP3 格式）
-func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, opts *tts.BackgroundMusicOptions) ([]byte, error) {
+// 返回混音后的音频数据
+func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName, voiceID string, opts *tts.BackgroundMusicOptions) ([]byte, error) {
 	// 检查 context 是否已取消
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("操作已取消: %w", err)
@@ -52,17 +54,29 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, opts *tts.Ba
 	opts = &optsCopy
 
 	// 设置默认值
-	// 使用 <= 0 来处理零值(未设置)的情况
 	if opts.Volume <= 0 {
-		opts.Volume = 0.3
+		opts.Volume = tts.DefaultBackgroundMusicVolume
 	}
 	if opts.MainAudioVolume <= 0 {
-		opts.MainAudioVolume = 1.0
+		opts.MainAudioVolume = tts.DefaultMainAudioVolume
 	}
 	// Loop 默认为 true
 	if opts.Loop == nil {
 		defaultLoop := true
 		opts.Loop = &defaultLoop
+	}
+
+	// 获取 TTS 语音的音质配置
+	profile, found := tts.LookupVoiceAudioProfile(providerName, voiceID)
+	if !found {
+		// 如果未找到配置，使用保守的默认值
+		profile = tts.VoiceAudioProfile{
+			Format:     tts.AudioFormatMP3,
+			SampleRate: tts.SampleRate24kHz,
+			Channels:   1,
+			Bitrate:    tts.MP3BitrateBalanced,
+			Lossless:   false,
+		}
 	}
 
 	// 创建临时目录
@@ -73,16 +87,21 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, opts *tts.Ba
 	defer os.RemoveAll(tempDir)
 
 	// 将语音音频写入临时文件
-	voiceFile := filepath.Join(tempDir, "voice.mp3")
+	// 使用 .dat 扩展名避免混淆，ffmpeg 会自动检测实际格式（WAV/MP3/等）
+	voiceFile := filepath.Join(tempDir, "voice.dat")
 	if err := os.WriteFile(voiceFile, voiceAudio, 0644); err != nil {
 		return nil, fmt.Errorf("写入语音文件失败: %w", err)
 	}
 
-	// 输出文件
-	outputFile := filepath.Join(tempDir, "mixed.mp3")
+	// 输出文件（扩展名根据格式设置）
+	outputExt := profile.Format
+	if outputExt == tts.AudioFormatAAC {
+		outputExt = "m4a" // AAC 通常用 m4a 容器
+	}
+	outputFile := filepath.Join(tempDir, "mixed."+outputExt)
 
 	// 构建 ffmpeg 混音命令
-	if err := mixAudio(voiceFile, opts.MusicPath, outputFile, opts); err != nil {
+	if err := mixAudio(voiceFile, opts.MusicPath, outputFile, opts, &profile); err != nil {
 		return nil, fmt.Errorf("混音失败: %w", err)
 	}
 
@@ -96,7 +115,7 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, opts *tts.Ba
 }
 
 // mixAudio 执行音频混音
-func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusicOptions) error {
+func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusicOptions, profile *tts.VoiceAudioProfile) error {
 	// 获取语音音频时长
 	voiceDuration, err := getAudioDuration(voiceFile)
 	if err != nil {
@@ -123,28 +142,25 @@ func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusic
 	}
 
 	// 混合两个音频流
-	// 使用 amix 滤镜，启用 normalize 防止削波
+	// 使用 amix 滤镜混音
 	merged := ffmpeg.Filter(
 		[]*ffmpeg.Stream{voiceStream, musicStream},
 		"amix",
 		ffmpeg.Args{
 			"inputs=2",
-			"duration=longest", // 使用最长的输入作为输出长度
-			"dropout_transition=2",
-			"normalize=0", // 禁用 normalize，因为我们已经通过 volume 滤镜控制了音量
+			"duration=longest",     // 使用最长的输入作为输出长度
+			"dropout_transition=2", // 平滑的音频过渡
+			"normalize=0",          // 禁用自动归一化，使用手动音量控制以保持更好的动态范围
 		},
 	)
 
-	// 输出为 MP3 格式
+	// 根据格式配置输出参数
+	outputKwArgs := buildOutputConfig(profile)
+
+	// 输出音频
 	var errBuf bytes.Buffer
 	err = merged.
-		Output(outputFile, ffmpeg.KwArgs{
-			"codec:a": "libmp3lame",
-			"b:a":     "192k",
-			"ar":      "24000", // 匹配 Edge TTS 的采样率
-			"ac":      "1",     // 单声道
-			"f":       "mp3",
-		}).
+		Output(outputFile, outputKwArgs).
 		OverWriteOutput().
 		WithErrorOutput(&errBuf).
 		Run()
@@ -158,6 +174,80 @@ func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusic
 	}
 
 	return nil
+}
+
+// buildOutputConfig 根据音质选项构建 ffmpeg 输出配置
+func buildOutputConfig(profile *tts.VoiceAudioProfile) ffmpeg.KwArgs {
+	// 确定采样率
+	sampleRate := profile.SampleRate
+	if sampleRate <= 0 {
+		sampleRate = tts.SampleRate44kHz // 默认 44.1kHz
+	}
+	// 限制最低采样率（语音场景通常不低于 16kHz）
+	if sampleRate < 16000 {
+		sampleRate = 16000
+	}
+
+	// 确定声道数
+	channels := profile.Channels
+	if channels <= 0 {
+		channels = 1
+	}
+
+	// 验证和限制声道数
+	if channels < 1 {
+		channels = 1
+	}
+	// 大多数有损格式不支持超过 2 声道
+	if channels > 2 && profile.Format != tts.AudioFormatWAV && profile.Format != tts.AudioFormatFLAC {
+		channels = 2
+	}
+
+	config := ffmpeg.KwArgs{
+		"ar": fmt.Sprintf("%d", sampleRate),
+		"ac": fmt.Sprintf("%d", channels),
+	}
+
+	switch profile.Format {
+	case tts.AudioFormatWAV:
+		// WAV 格式 - 无损，最高音质
+		config["codec:a"] = "pcm_s16le" // 16位 PCM
+		config["f"] = "wav"
+
+	case tts.AudioFormatFLAC:
+		// FLAC 格式 - 无损压缩，高音质，文件较小
+		config["codec:a"] = "flac"
+		config["compression_level"] = "8" // 0-12，8是推荐的平衡值
+		config["f"] = "flac"
+
+	case tts.AudioFormatM4A, tts.AudioFormatAAC:
+		// AAC/M4A 格式 - 有损压缩，中高音质，文件小
+		config["codec:a"] = "aac"
+		config["f"] = "mp4" // M4A 使用 MP4 容器
+		// VBR 质量模式: 0-9，0最高质量
+		if profile.Bitrate > 0 && profile.Bitrate <= 9 {
+			config["q:a"] = fmt.Sprintf("%d", profile.Bitrate)
+		} else {
+			config["q:a"] = "1" // 默认高质量
+		}
+
+	case tts.AudioFormatMP3:
+		fallthrough
+	default:
+		// MP3 格式 - 有损压缩，通用性好
+		config["codec:a"] = "libmp3lame"
+		config["f"] = "mp3"
+
+		// 设置比特率（优先保持与 TTS 输出一致）
+		bitrate := profile.Bitrate
+		if bitrate > 0 {
+			config["b:a"] = fmt.Sprintf("%dk", bitrate)
+		} else {
+			config["q:a"] = "0" // 无明确比特率时退回最高质量
+		}
+	}
+
+	return config
 }
 
 // filterConfig 滤镜配置

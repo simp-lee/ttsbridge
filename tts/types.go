@@ -1,45 +1,102 @@
 package tts
 
-import "context"
+import (
+	"context"
+	"errors"
+	"time"
 
-// SynthesizeOptions 语音合成选项
-type SynthesizeOptions struct {
-	// Text 要合成的文本内容
-	Text string
+	"github.com/simp-lee/retry"
+)
 
-	// Voice 语音名称,如 "zh-CN-XiaoxiaoNeural"
-	Voice string
+// Default retry and timeout configuration
+// These values can be used by all TTS providers as starting defaults
+const (
+	// DefaultMaxRetries is the default maximum number of retry attempts
+	DefaultMaxRetries = 3
 
-	// Rate 语速,范围通常为 0.5-2.0,1.0 为正常速度
-	Rate float64
+	// DefaultBackoffInitial is the default initial backoff duration for exponential retry
+	DefaultBackoffInitial = 100 * time.Millisecond
 
-	// Volume 音量,范围通常为 0.0-1.0,1.0 为最大音量
-	Volume float64
+	// DefaultBackoffMax is the default maximum backoff duration for exponential retry
+	DefaultBackoffMax = 5 * time.Second
 
-	// Pitch 音调,范围通常为 0.5-2.0,1.0 为正常音调
-	Pitch float64
+	// DefaultBackoffJitter is the default jitter duration for exponential retry
+	DefaultBackoffJitter = 1 * time.Second
 
-	// Locale 语言区域,如 "zh-CN", "en-US"
-	Locale string
+	// DefaultConnectTimeout is the default timeout for establishing connections
+	DefaultConnectTimeout = 10 * time.Second
 
-	// WordBoundaryEnabled 是否启用词边界元数据 (默认: false)
-	WordBoundaryEnabled bool
+	// DefaultReceiveTimeout is the default timeout for receiving data
+	DefaultReceiveTimeout = 60 * time.Second
 
-	// SentenceBoundaryEnabled 是否启用句边界元数据 (默认: false)
-	SentenceBoundaryEnabled bool
+	// DefaultHTTPTimeout is the default timeout for HTTP requests
+	DefaultHTTPTimeout = 30 * time.Second
+)
 
-	// MetadataCallback 元数据回调函数，用于接收词/句边界信息
-	// 参数: metadataType (WordBoundary/SentenceBoundary), offset (时间偏移), duration (持续时间), text (文本)
-	MetadataCallback func(metadataType string, offset int64, duration int64, text string)
+// Language 语言代码类型
+type Language string
 
-	// BackgroundMusic 背景音乐选项
-	BackgroundMusic *BackgroundMusicOptions
+// 常见语言代码常量
+const (
+	LanguageZhCN Language = "zh-CN" // 简体中文
+	LanguageZhTW Language = "zh-TW" // 繁体中文
+	LanguageEnUS Language = "en-US" // 美式英语
+	LanguageEnGB Language = "en-GB" // 英式英语
+	LanguageJaJP Language = "ja-JP" // 日语
+	LanguageKoKR Language = "ko-KR" // 韩语
+	LanguageFrFR Language = "fr-FR" // 法语
+	LanguageDeDE Language = "de-DE" // 德语
+	LanguageEsES Language = "es-ES" // 西班牙语
+	LanguageRuRU Language = "ru-RU" // 俄语
+	LanguageItIT Language = "it-IT" // 意大利语
+	LanguagePtBR Language = "pt-BR" // 葡萄牙语（巴西）
+	LanguageArSA Language = "ar-SA" // 阿拉伯语
+	LanguageThTH Language = "th-TH" // 泰语
+	LanguageViVN Language = "vi-VN" // 越南语
+)
 
-	// Extra 提供商特定的额外参数
-	Extra map[string]interface{}
-}
+// Gender 性别类型
+type Gender string
 
-// BackgroundMusicOptions 背景音乐混音选项
+// 性别常量
+const (
+	GenderMale    Gender = "Male"    // 男性
+	GenderFemale  Gender = "Female"  // 女性
+	GenderNeutral Gender = "Neutral" // 中性
+)
+
+// Audio quality constants for background music mixing
+const (
+	// Output formats
+	AudioFormatMP3  = "mp3"  // MP3 格式，兼容性最好
+	AudioFormatWAV  = "wav"  // WAV 格式，无损但文件大
+	AudioFormatFLAC = "flac" // FLAC 格式，无损压缩
+	AudioFormatM4A  = "m4a"  // M4A/AAC 格式，高压缩率
+	AudioFormatAAC  = "aac"  // AAC 格式（通常用 M4A 容器）
+
+	// Quality profiles (音质预设)
+	QualityProfileStreaming = "streaming" // 流媒体模式：MP3 192kbps
+	QualityProfileBalanced  = "balanced"  // 平衡模式：MP3 256kbps（推荐默认）
+	QualityProfileHigh      = "high"      // 高音质模式：MP3 320kbps
+	QualityProfileArchival  = "archival"  // 存档模式：FLAC 无损
+
+	// MP3 bitrate presets (kbps)
+	MP3BitrateStreaming = 192 // 流媒体质量
+	MP3BitrateBalanced  = 256 // 平衡质量（新默认）
+	MP3BitrateHigh      = 320 // 最高 MP3 质量
+	MP3BitrateMinimum   = 128 // 最低推荐质量
+
+	// Sample rates (Hz)
+	SampleRate24kHz = 24000 // TTS 常用采样率
+	SampleRate44kHz = 44100 // CD 音质采样率
+	SampleRate48kHz = 48000 // 专业音频采样率
+
+	// Default values
+	DefaultBackgroundMusicVolume = 0.3 // 默认背景音乐音量
+	DefaultMainAudioVolume       = 1.0 // 默认主音频音量
+)
+
+// BackgroundMusicOptions 背景音乐混音选项（通用组件）
 type BackgroundMusicOptions struct {
 	// MusicPath 背景音乐文件路径（支持 MP3, WAV, OGG, FLAC 等常见格式）
 	MusicPath string
@@ -64,34 +121,52 @@ type BackgroundMusicOptions struct {
 	MainAudioVolume float64
 }
 
-// Voice 语音信息
+// Voice 语音信息 - 最小公共结构
+// 只包含跨Provider的通用字段,用于统一查询和过滤
+// Extra 字段用于存储 Provider 特有的扩展信息
 type Voice struct {
-	// ID 语音唯一标识
-	ID string
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Language  Language   `json:"language"`            // 主语言代码,如 "zh-CN", "en-US"
+	Languages []Language `json:"languages,omitempty"` // 支持的所有语言（包含主语言）
+	Gender    Gender     `json:"gender"`              // 性别: Male, Female, Neutral
+	Provider  string     `json:"provider"`
+	Extra     any        `json:"extra,omitempty"` // Provider 特有的扩展信息
+}
 
-	// Name 语音名称,如 "晓晓"
-	Name string
+// SupportsLanguage 检查是否支持指定语言
+// 支持完全匹配或前缀匹配（如 "zh" 匹配 "zh-CN"）
+func (v *Voice) SupportsLanguage(lang string) bool {
+	langStr := string(v.Language)
+	// 检查主语言
+	if langStr == lang || len(langStr) >= len(lang) && langStr[:len(lang)] == lang {
+		return true
+	}
+	// 检查多语言列表
+	for _, l := range v.Languages {
+		lStr := string(l)
+		if lStr == lang || len(lStr) >= len(lang) && lStr[:len(lang)] == lang {
+			return true
+		}
+	}
+	return false
+}
 
-	// DisplayName 显示名称,如 "晓晓 (女性)"
-	DisplayName string
-
-	// Locale 语言区域,如 "zh-CN"
-	Locale string
-
-	// Gender 性别: Male, Female, Neutral
-	Gender string
-
-	// ShortName 短名称,如 "zh-CN-XiaoxiaoNeural"
-	ShortName string
-
-	// Provider 提供商名称
-	Provider string
-
-	// Styles 支持的风格列表,如 ["affectionate", "angry", "cheerful"]
-	Styles []string
-
-	// Description 描述信息
-	Description string
+// GetExtra 获取特定类型的扩展信息
+// 使用泛型提供类型安全的访问方式
+//
+// 示例:
+//
+//	if extra, ok := voice.GetExtra[*edgetts.VoiceExtra](); ok {
+//	    styles := extra.Styles
+//	}
+func GetExtra[T any](v *Voice) (T, bool) {
+	var zero T
+	if v.Extra == nil {
+		return zero, false
+	}
+	extra, ok := v.Extra.(T)
+	return extra, ok
 }
 
 // AudioStream 音频流接口
@@ -103,16 +178,17 @@ type AudioStream interface {
 	Close() error
 }
 
-// Provider TTS 提供商接口
-type Provider interface {
+// Provider 泛型 TTS 提供商接口
+// T 为该 Provider 的 SynthesizeOptions 类型
+type Provider[T any] interface {
 	// Name 返回提供商名称
 	Name() string
 
 	// Synthesize 同步合成语音,返回完整的音频数据
-	Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]byte, error)
+	Synthesize(ctx context.Context, opts T) ([]byte, error)
 
 	// SynthesizeStream 流式合成语音,返回音频流
-	SynthesizeStream(ctx context.Context, opts *SynthesizeOptions) (AudioStream, error)
+	SynthesizeStream(ctx context.Context, opts T) (AudioStream, error)
 
 	// ListVoices 列出可用的语音列表
 	ListVoices(ctx context.Context, locale string) ([]Voice, error)
@@ -156,3 +232,60 @@ const (
 	ErrCodeUnexpectedResponse = "UNEXPECTED_RESPONSE" // 意外响应
 	ErrCodeWebSocketError     = "WEBSOCKET_ERROR"     // WebSocket 连接错误
 )
+
+// IsRetryableError checks if a TTS error should be retried
+// This function is used by providers to determine if a failed operation should be retried
+func IsRetryableError(err error) bool {
+	var ttsErr *Error
+	if err == nil {
+		return false
+	}
+
+	// Context cancellation and deadline errors should never be retried
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Non-TTS errors are not retryable by default
+	if !errors.As(err, &ttsErr) {
+		return false
+	}
+
+	switch ttsErr.Code {
+	case ErrCodeClockSkew,
+		ErrCodeNetworkError,
+		ErrCodeWebSocketError,
+		ErrCodeTimeout,
+		ErrCodeNoAudioReceived,
+		ErrCodeProviderUnavail:
+		return true
+	default:
+		return false
+	}
+}
+
+// RetryOptions creates standard retry configuration for TTS providers.
+// This function centralizes retry configuration to ensure consistency across all providers.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control
+//   - maxAttempts: Maximum number of retry attempts (including the first try)
+//
+// Returns a slice of retry.Option configured with:
+//   - Exponential backoff with jitter (100ms initial, 5s max, 1s jitter)
+//   - IsRetryableError condition to determine which errors should trigger retries
+//
+// Usage example:
+//
+//	err := retry.Do(func() error {
+//	    return someOperation()
+//	}, tts.RetryOptions(ctx, maxAttempts)...)
+func RetryOptions(ctx context.Context, maxAttempts int) []retry.Option {
+	return []retry.Option{
+		retry.WithContext(ctx),
+		retry.WithTimes(maxAttempts),
+		retry.WithExponentialBackoff(DefaultBackoffInitial, DefaultBackoffMax, DefaultBackoffJitter),
+		retry.WithLogger(func(string, ...any) {}),
+		retry.WithRetryCondition(IsRetryableError),
+	}
+}

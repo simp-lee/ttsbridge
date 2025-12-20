@@ -10,14 +10,11 @@ import (
 	"time"
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
-	"github.com/simp-lee/ttsbridge/tts"
 )
 
 func main() {
 	// 创建 Edge TTS 提供商，配置接收超时为 90 秒
-	provider := edgetts.NewWithOptions(&edgetts.ProviderOptions{
-		ReceiveTimeout: 90 * time.Second,
-	})
+	provider := edgetts.New().WithReceiveTimeout(90 * time.Second)
 
 	// 创建一个超长文本（超过 4096 字节）
 	longText := strings.Repeat("这是一段用于测试长文本分块功能的内容。", 200) +
@@ -32,7 +29,7 @@ func main() {
 	var wordCount int
 	var sentenceCount int
 
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:                    longText,
 		Voice:                   "zh-CN-XiaoxiaoNeural",
 		Rate:                    1.0,
@@ -75,7 +72,7 @@ func main() {
 	wordCount = 0
 	sentenceCount = 0
 
-	streamOpts := &tts.SynthesizeOptions{
+	streamOpts := &edgetts.SynthesizeOptions{
 		Text:                    longText,
 		Voice:                   "zh-CN-XiaoxiaoNeural",
 		Rate:                    1.0,

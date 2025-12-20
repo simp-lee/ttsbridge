@@ -32,6 +32,10 @@ Thumbs.db
 *.ogg
 *.opus
 *.flac
+*.m4a
+
+# Test output artifacts
+audio/test_audio_quality_output/
 
 # Cache
 cache/
@@ -52,3 +56,4 @@ temp/
 docs/
 bin/
 *.zip
+_upstream/

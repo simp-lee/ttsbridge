@@ -41,7 +41,7 @@ func main() {
 func basicUsage() {
 	provider := edgetts.New()
 
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:   "你好，欢迎使用 TTSBridge！",
 		Voice:  "zh-CN-XiaoxiaoNeural",
 		Rate:   1.0,
@@ -77,7 +77,7 @@ func metadataDemo() {
 	}
 	var subtitles []Subtitle
 
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:                "这是第一句话。这是第二句话。这是第三句话。",
 		Voice:               "zh-CN-XiaoxiaoNeural",
 		WordBoundaryEnabled: true, // 启用词边界
@@ -131,14 +131,13 @@ func metadataDemo() {
 // customConfigDemo 自定义配置演示
 func customConfigDemo() {
 	// 创建带自定义配置的 Provider
-	provider := edgetts.NewWithOptions(&edgetts.ProviderOptions{
-		HTTPTimeout:      60 * time.Second, // HTTP 超时 60 秒
-		ConnectTimeout:   15 * time.Second, // WebSocket 连接超时 15 秒
-		MaxRetryAttempts: 3,                // 最多重试 3 次
-		// ProxyURL: "http://proxy.example.com:8080", // 如果需要代理，取消注释
-	})
+	provider := edgetts.New().
+		WithHTTPTimeout(60 * time.Second).
+		WithConnectTimeout(15 * time.Second).
+		WithMaxAttempts(3)
+	// 如果需要代理: .WithProxy("http://proxy.example.com:8080")
 
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:   "这是使用自定义配置的示例。",
 		Voice:  "zh-CN-YunxiNeural",
 		Rate:   1.2, // 加快 20%
@@ -185,18 +184,12 @@ func listVoicesDemo() {
 
 	for i := 0; i < displayCount; i++ {
 		v := voices[i]
-		displayName := v.DisplayName
+		displayName := v.Name
 		if displayName == "" {
-			displayName = v.Name
-		}
-		if displayName == "" {
-			displayName = v.ShortName
+			displayName = v.ID
 		}
 		fmt.Printf("  %s (%s)\n", displayName, v.Gender)
-		fmt.Printf("    ID: %s\n", v.ShortName)
-		if len(v.Styles) > 0 {
-			fmt.Printf("    风格: %v\n", v.Styles)
-		}
+		fmt.Printf("    ID: %s\n", v.ID)
 	}
 
 	if len(voices) > displayCount {
@@ -209,7 +202,7 @@ func errorHandlingDemo() {
 	provider := edgetts.New()
 
 	// 使用错误的语音名称
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:  "测试错误处理",
 		Voice: "invalid-voice-name",
 	}

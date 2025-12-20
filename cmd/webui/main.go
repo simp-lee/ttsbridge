@@ -16,11 +16,13 @@ import (
 
 	"github.com/simp-lee/ttsbridge/audio"
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
+	"github.com/simp-lee/ttsbridge/providers/volcengine"
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
-var provider *edgetts.Provider
-var cachedVoices []tts.Voice
+var edgeProvider *edgetts.Provider
+var volcProvider *volcengine.Provider
+var cachedVoices map[string][]tts.Voice
 
 // startCleanupTask 启动定期清理任务
 func startCleanupTask() {
@@ -66,17 +68,30 @@ func main() {
 	checkFFmpegInstallation()
 
 	// 初始化提供商
-	provider = edgetts.New()
+	edgeProvider = edgetts.New()
+	volcProvider = volcengine.New()
 
 	// 预加载语音列表
 	fmt.Println("正在加载语音列表...")
 	ctx := context.Background()
-	var err error
-	cachedVoices, err = provider.ListVoices(ctx, "")
-	if err != nil {
-		log.Fatalf("❌ 加载语音列表失败: %v", err)
+	cachedVoices = make(map[string][]tts.Voice)
+
+	// 加载 EdgeTTS 语音
+	if voices, err := edgeProvider.ListVoices(ctx, ""); err != nil {
+		log.Printf("⚠️  加载 edgetts 语音列表失败: %v", err)
+	} else {
+		cachedVoices["edgetts"] = voices
+		fmt.Printf("✅ 已加载 edgetts: %d 个语音\n", len(voices))
 	}
-	fmt.Printf("✅ 已加载 %d 个语音\n\n", len(cachedVoices))
+
+	// 加载 Volcengine 语音
+	if voices, err := volcProvider.ListVoices(ctx, ""); err != nil {
+		log.Printf("⚠️  加载 volcengine 语音列表失败: %v", err)
+	} else {
+		cachedVoices["volcengine"] = voices
+		fmt.Printf("✅ 已加载 volcengine: %d 个语音\n", len(voices))
+	}
+	fmt.Println()
 
 	// 启动定期清理旧的上传文件（每小时清理一次超过24小时的文件）
 	go startCleanupTask()
@@ -174,6 +189,24 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             grid-template-columns: repeat(3, 1fr);
             gap: 18px;
             margin-bottom: 28px;
+            transition: opacity 0.3s ease;
+        }
+        .controls.disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+        .provider-note {
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: #fff3cd;
+            border-left: 3px solid #ffc107;
+            border-radius: 4px;
+            font-size: 12px;
+            color: #856404;
+            display: none;
+        }
+        .provider-note.show {
+            display: block;
         }
         .control-item label { font-size: 13px; }
         .control-item input[type="range"] {
@@ -450,6 +483,14 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         <div class="content">
             <form id="ttsForm">
                 <div class="form-group">
+                    <label for="provider">选择提供商</label>
+                    <select id="provider" required>
+                        <option value="edgetts">EdgeTTS (Microsoft 语音)</option>
+                        <option value="volcengine">火山翻译 (免费)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
                     <label for="locale">选择语言</label>
                     <select id="locale" required>
                         <option value="">加载中...</option>
@@ -469,7 +510,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                     <textarea id="text" required placeholder="在这里输入要转换为语音的文本...">你好，欢迎使用 TTSBridge！这是一个简单、快速、免费的文字转语音工具。</textarea>
                 </div>
 
-                <div class="controls">
+                <div class="controls" id="ttsControls">
                     <div class="control-item">
                         <label for="rate">语速</label>
                         <input type="range" id="rate" min="0.5" max="2.0" step="0.1" value="1.0">
@@ -485,6 +526,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                         <input type="range" id="pitch" min="0.5" max="2.0" step="0.1" value="1.0">
                         <div class="control-value" id="pitchValue">1.0x</div>
                     </div>
+                </div>
+                <div class="provider-note" id="providerNote">
+                    ℹ️ 当前提供商不支持语速、音量、音调调节
                 </div>
 
                 <!-- 背景音乐配置 -->
@@ -566,6 +610,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         const RESET_BUTTON_DELAY = 2000;
         
         // DOM 元素引用
+        const providerSelect = document.getElementById('provider');
         const localeSelect = document.getElementById('locale');
         const voiceSelect = document.getElementById('voice');
         const voiceInfo = document.getElementById('voiceInfo');
@@ -581,6 +626,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         let uploadedMusicPath = '';
         let isUploading = false;
         let currentBlobUrl = null; // 跟踪当前的 blob URL
+        let currentProvider = 'edgetts'; // 当前选择的提供商
 
         // 检查 ffmpeg 是否安装
         function checkFFmpeg() {
@@ -642,22 +688,56 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         });
 
         // 加载语言列表
-        fetch('/api/locales')
-            .then(res => res.json())
-            .then(data => {
-                localeSelect.innerHTML = '<option value="">请选择语言</option>';
-                data.locales.forEach(locale => {
-                    const option = document.createElement('option');
-                    option.value = locale.code;
-                    option.textContent = locale.name + ' (' + locale.count + ' 个语音)';
-                    localeSelect.appendChild(option);
+        function loadLocales(provider) {
+            fetch('/api/locales?provider=' + provider)
+                .then(res => res.json())
+                .then(data => {
+                    localeSelect.innerHTML = '<option value="">请选择语言</option>';
+                    data.locales.forEach(locale => {
+                        const option = document.createElement('option');
+                        option.value = locale.code;
+                        option.textContent = locale.name + ' (' + locale.count + ' 个语音)';
+                        localeSelect.appendChild(option);
+                    });
+                    allVoices = data.voices;
+                    // 重置语音选择
+                    voiceSelect.innerHTML = '<option value="">请先选择语言</option>';
+                    voiceInfo.style.display = 'none';
+                })
+                .catch(err => {
+                    console.error('加载语言列表失败:', err);
+                    showStatus('error', '❌ 加载语言列表失败，请刷新页面重试');
                 });
-                allVoices = data.voices;
-            })
-            .catch(err => {
-                console.error('加载语言列表失败:', err);
-                showStatus('error', '❌ 加载语言列表失败，请刷新页面重试');
-            });
+        }
+
+        // 初始加载
+        loadLocales(currentProvider);
+
+        // 提供商改变时重新加载语音列表
+        providerSelect.addEventListener('change', function() {
+            currentProvider = this.value;
+            loadLocales(currentProvider);
+            updateControlsVisibility(currentProvider);
+        });
+
+        // 根据提供商更新控件可见性
+        function updateControlsVisibility(provider) {
+            const ttsControls = document.getElementById('ttsControls');
+            const providerNote = document.getElementById('providerNote');
+            
+            if (provider === 'volcengine') {
+                // Volcengine 不支持语速、音量、音调
+                ttsControls.classList.add('disabled');
+                providerNote.classList.add('show');
+            } else {
+                // EdgeTTS 支持
+                ttsControls.classList.remove('disabled');
+                providerNote.classList.remove('show');
+            }
+        }
+
+        // 初始化控件状态
+        updateControlsVisibility(currentProvider);
 
         // 语言改变时更新语音列表
         localeSelect.addEventListener('change', function() {
@@ -791,6 +871,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
             const text = document.getElementById('text').value;
             const voice = document.getElementById('voice').value;
+            const provider = document.getElementById('provider').value;
             const rate = parseFloat(document.getElementById('rate').value);
             const volume = parseFloat(document.getElementById('volume').value);
             const pitch = parseFloat(document.getElementById('pitch').value);
@@ -801,7 +882,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             }
 
             // 构建请求体
-            const requestBody = { text, voice, rate, volume, pitch };
+            const requestBody = { text, voice, provider, rate, volume, pitch };
 
             // 如果上传了背景音乐，添加配置
             if (uploadedMusicPath) {
@@ -846,6 +927,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                     throw new Error('收到的音频数据为空');
                 }
                 
+                // 获取音频格式
+                const audioFormat = response.headers.get('X-Audio-Format') || 'mp3';
+                
                 // 释放之前的 blob URL 以防止内存泄漏
                 if (currentBlobUrl) {
                     URL.revokeObjectURL(currentBlobUrl);
@@ -857,7 +941,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                 // 保存音频 URL 和文件名用于下载
                 audioPlayer.src = url;
                 audioPlayer.dataset.audioUrl = url;
-                audioPlayer.dataset.fileName = 'tts_' + voice + '_' + Date.now() + '.mp3';
+                audioPlayer.dataset.fileName = 'tts_' + voice + '_' + Date.now() + '.' + audioFormat;
                 
                 // 显示音频播放器和下载按钮
                 audioContainer.style.display = 'block';
@@ -913,10 +997,21 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetLocales(w http.ResponseWriter, r *http.Request) {
+	providerName := r.URL.Query().Get("provider")
+	if providerName == "" {
+		providerName = "edgetts" // 默认使用 EdgeTTS
+	}
+
+	voices, ok := cachedVoices[providerName]
+	if !ok {
+		respondError(w, "不支持的提供商: "+providerName, http.StatusBadRequest)
+		return
+	}
+
 	// 按语言分组
 	voicesByLocale := make(map[string][]tts.Voice)
-	for _, voice := range cachedVoices {
-		voicesByLocale[voice.Locale] = append(voicesByLocale[voice.Locale], voice)
+	for _, voice := range voices {
+		voicesByLocale[string(voice.Language)] = append(voicesByLocale[string(voice.Language)], voice)
 	}
 
 	// 获取语言列表
@@ -972,18 +1067,15 @@ func handleGetLocales(w http.ResponseWriter, r *http.Request) {
 	for locale, voices := range voicesByLocale {
 		simple := make([]SimpleVoice, 0)
 		for _, v := range voices {
-			displayName := v.DisplayName
+			displayName := v.Name
 			if displayName == "" {
-				displayName = v.Name
-			}
-			if displayName == "" {
-				displayName = v.ShortName
+				displayName = v.ID
 			}
 			simple = append(simple, SimpleVoice{
-				ShortName:   v.ShortName,
+				ShortName:   v.ID,
 				DisplayName: displayName,
-				Gender:      v.Gender,
-				Styles:      v.Styles,
+				Gender:      string(v.Gender),
+				Styles:      []string{}, // 简化的 Voice 不包含 Styles
 			})
 		}
 		simplifiedVoices[locale] = simple
@@ -997,11 +1089,22 @@ func handleGetLocales(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetVoices(w http.ResponseWriter, r *http.Request) {
+	providerName := r.URL.Query().Get("provider")
+	if providerName == "" {
+		providerName = "edgetts" // 默认使用 EdgeTTS
+	}
+
+	allVoices, ok := cachedVoices[providerName]
+	if !ok {
+		respondError(w, "不支持的提供商: "+providerName, http.StatusBadRequest)
+		return
+	}
+
 	locale := r.URL.Query().Get("locale")
 
 	voices := make([]tts.Voice, 0)
-	for _, voice := range cachedVoices {
-		if locale == "" || voice.Locale == locale {
+	for _, voice := range allVoices {
+		if locale == "" || string(voice.Language) == locale {
 			voices = append(voices, voice)
 		}
 	}
@@ -1066,6 +1169,7 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Text            string  `json:"text"`
 		Voice           string  `json:"voice"`
+		Provider        string  `json:"provider"`
 		Rate            float64 `json:"rate"`
 		Volume          float64 `json:"volume"`
 		Pitch           float64 `json:"pitch"`
@@ -1090,17 +1194,18 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opts := &tts.SynthesizeOptions{
-		Text:   req.Text,
-		Voice:  req.Voice,
-		Rate:   req.Rate,
-		Volume: req.Volume,
-		Pitch:  req.Pitch,
+	if req.Provider == "" {
+		req.Provider = "edgetts" // 默认使用 EdgeTTS
 	}
 
-	// 如果提供了背景音乐配置，添加到选项中
+	ctx := context.Background()
+	var audio []byte
+	var err error
+
+	// 构建背景音乐配置（如果有）
+	var bgMusic *tts.BackgroundMusicOptions
 	if req.BackgroundMusic != nil && req.BackgroundMusic.MusicPath != "" {
-		opts.BackgroundMusic = &tts.BackgroundMusicOptions{
+		bgMusic = &tts.BackgroundMusicOptions{
 			MusicPath:       req.BackgroundMusic.MusicPath,
 			Volume:          req.BackgroundMusic.Volume,
 			FadeIn:          req.BackgroundMusic.FadeIn,
@@ -1111,8 +1216,31 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx := context.Background()
-	audio, err := provider.Synthesize(ctx, opts)
+	// 根据不同的 provider 使用不同的 options
+	switch req.Provider {
+	case "edgetts":
+		opts := &edgetts.SynthesizeOptions{
+			Text:            req.Text,
+			Voice:           req.Voice,
+			Rate:            req.Rate,
+			Volume:          req.Volume,
+			Pitch:           req.Pitch,
+			BackgroundMusic: bgMusic,
+		}
+		audio, err = edgeProvider.Synthesize(ctx, opts)
+
+	case "volcengine":
+		opts := &volcengine.SynthesizeOptions{
+			Text:            req.Text,
+			Voice:           req.Voice,
+			BackgroundMusic: bgMusic,
+		}
+		audio, err = volcProvider.Synthesize(ctx, opts)
+
+	default:
+		respondError(w, "不支持的提供商: "+req.Provider, http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		// 提供更友好的错误提示
 		errorMsg := err.Error()
@@ -1125,8 +1253,20 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "audio/mpeg")
-	w.Header().Set("Content-Disposition", "attachment; filename=tts.mp3")
+	// 根据 provider 确定输出格式
+	var contentType, fileExt string
+	switch req.Provider {
+	case "volcengine":
+		contentType = "audio/wav"
+		fileExt = "wav"
+	default: // edgetts 和其他
+		contentType = "audio/mpeg"
+		fileExt = "mp3"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=tts.%s", fileExt))
+	w.Header().Set("X-Audio-Format", fileExt) // 自定义头,供前端识别格式
 	w.Write(audio)
 }
 

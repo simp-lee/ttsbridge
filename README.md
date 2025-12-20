@@ -19,6 +19,12 @@ TTSBridge 是一个通用的文字转语音(Text-to-Speech)工具,为多个 TTS 
   - ✅ 长文本自动分割（无限长度）
   - ✅ UTF-8 安全和字符清理
   - ✅ 生产级稳定性
+- [x] **火山引擎 TTS** - 🆓 **完全免费，无需认证！**
+  - ✅ 基于火山翻译 API
+  - ✅ 21+ 款优质音色
+  - ✅ 支持中文、英文、日文等多语言
+  - ✅ 方言音色：东北话、四川话、广西话等
+  - ✅ 完全免费，无需 APP_ID 或 ACCESS_TOKEN
 - [ ] Azure Cognitive Services TTS
 - [ ] 阿里云 TTS
 - [ ] 腾讯云 TTS
@@ -54,7 +60,7 @@ func main() {
     provider := edgetts.New()
     
     // 配置语音参数（音频格式已简化为官方默认：24kHz 48kbps MP3）
-    opts := &tts.SynthesizeOptions{
+    opts := &edgetts.SynthesizeOptions{
         Text:     "你好,欢迎使用 TTSBridge!",
         Voice:    "zh-CN-XiaoxiaoNeural",  // 语音名称
         Rate:     1.0,                      // 语速 (0.5-2.0)
@@ -110,10 +116,8 @@ if err != nil {
 }
 
 for _, voice := range voices {
-    fmt.Printf("%s (%s): %s\n", voice.DisplayName, voice.Gender, voice.ShortName)
-    if len(voice.Styles) > 0 {
-        fmt.Printf("  风格: %v\n", voice.Styles)
-    }
+    fmt.Printf("%s (%s): %s\n", voice.Name, voice.Gender, voice.ID)
+    fmt.Printf("  Locale: %s, Provider: %s\n", voice.Locale, voice.Provider)
 }
 ```
 
@@ -122,16 +126,16 @@ for _, voice := range voices {
 ```go
 // 使用代理和自定义超时
 provider := edgetts.NewWithOptions(&edgetts.ProviderOptions{
-    ClientToken:      "custom-token",
-    ProxyURL:         "http://proxy.example.com:8080",
-    HTTPTimeout:      60 * time.Second,
-    ConnectTimeout:   15 * time.Second,
-    MaxRetryAttempts: 5,
-    ReceiveTimeout:   90 * time.Second,
+    ClientToken:    "custom-token",
+    ProxyURL:       "http://proxy.example.com:8080",
+    HTTPTimeout:    60 * time.Second,
+    ConnectTimeout: 15 * time.Second,
+    MaxAttempts:    5, // 最多尝试 5 次（包括首次尝试）
+    ReceiveTimeout: 90 * time.Second,
 })
 
 // 启用元数据获取字幕
-opts := &tts.SynthesizeOptions{
+opts := &edgetts.SynthesizeOptions{
     Text:                    "这是一段测试文本。",
     Voice:                   "zh-CN-XiaoxiaoNeural",
     WordBoundaryEnabled:     true,
@@ -203,7 +207,7 @@ if err != nil {
 为语音添加背景音乐，打造专业音频效果：
 
 ```go
-opts := &tts.SynthesizeOptions{
+opts := &edgetts.SynthesizeOptions{
     Text:   "你好，欢迎收听我们的播客！",
     Voice:  "zh-CN-XiaoxiaoNeural",
     Rate:   1.0,

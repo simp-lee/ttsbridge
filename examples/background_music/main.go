@@ -38,7 +38,7 @@ func main() {
 	provider := edgetts.New()
 
 	// 配置语音合成选项
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:   "欢迎使用 TTSBridge 背景音乐混音功能！这是一个示例，演示如何将背景音乐与语音合成结果混合。您可以调节背景音乐的音量、设置淡入淡出效果、选择起始时间点，以及控制是否循环播放。",
 		Voice:  "zh-CN-XiaoxiaoNeural",
 		Rate:   1.0,
@@ -46,13 +46,11 @@ func main() {
 		Pitch:  1.0,
 		// 配置背景音乐
 		BackgroundMusic: &tts.BackgroundMusicOptions{
-			MusicPath:       musicPath,     // 背景音乐文件路径
-			Volume:          0.3,           // 背景音乐音量 30%
-			FadeIn:          2.0,           // 淡入 2 秒
-			FadeOut:         3.0,           // 淡出 3 秒
-			StartTime:       0.0,           // 从头开始
-			Loop:            boolPtr(true), // 循环播放
-			MainAudioVolume: 1.0,           // 主音频音量 100%
+			MusicPath: musicPath,     // 背景音乐文件路径
+			Volume:    0.3,           // 背景音乐音量 30%
+			FadeIn:    2.0,           // 淡入 2 秒
+			FadeOut:   3.0,           // 淡出 3 秒
+			Loop:      boolPtr(true), // 循环播放
 		},
 	}
 
@@ -62,7 +60,7 @@ func main() {
 	fmt.Println("🔊 背景音乐音量:", fmt.Sprintf("%.0f%%", opts.BackgroundMusic.Volume*100))
 	fmt.Println("⏱️  淡入:", fmt.Sprintf("%.1f秒", opts.BackgroundMusic.FadeIn))
 	fmt.Println("⏱️  淡出:", fmt.Sprintf("%.1f秒", opts.BackgroundMusic.FadeOut))
-	fmt.Println("🔁 循环播放:", opts.BackgroundMusic.Loop)
+	fmt.Println("🔁 循环播放:", *opts.BackgroundMusic.Loop)
 	fmt.Println()
 
 	// 开始合成

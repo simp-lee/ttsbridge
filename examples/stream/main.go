@@ -7,21 +7,14 @@ import (
 	"os"
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
-	"github.com/simp-lee/ttsbridge/tts"
 )
 
 func main() {
 	// 创建 Edge TTS 提供商
 	provider := edgetts.New()
 
-	// 创建 TTS 引擎
-	engine, err := tts.NewEngine(provider)
-	if err != nil {
-		log.Fatalf("创建引擎失败: %v", err)
-	}
-
 	// 配置语音参数
-	opts := &tts.SynthesizeOptions{
+	opts := &edgetts.SynthesizeOptions{
 		Text:   "这是一个流式语音合成的示例。TTSBridge 可以实时获取音频数据块,非常适合需要低延迟的场景。",
 		Voice:  "zh-CN-XiaoxiaoNeural",
 		Rate:   1.0,
@@ -33,7 +26,7 @@ func main() {
 
 	// 流式合成语音
 	ctx := context.Background()
-	stream, err := engine.SynthesizeStream(ctx, opts)
+	stream, err := provider.SynthesizeStream(ctx, opts)
 	if err != nil {
 		log.Fatalf("合成失败: %v", err)
 	}

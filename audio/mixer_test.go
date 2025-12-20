@@ -54,9 +54,34 @@ func TestValidateBackgroundMusicFile(t *testing.T) {
 			// 如果不是空路径或不存在的文件，创建测试文件
 			if tt.filePath != "" && tt.filePath != "nonexistent.mp3" {
 				testFilePath = filepath.Join(tempDir, tt.filePath)
-				// 创建一个小的测试文件
-				if err := os.WriteFile(testFilePath, []byte("test content"), 0644); err != nil {
-					t.Fatalf("创建测试文件失败: %v", err)
+
+				// 如果有 ffmpeg 且文件是音频格式，生成真实音频文件
+				if IsFFmpegInstalled() && IsSupportedAudioExtension(filepath.Ext(tt.filePath)) {
+					// 生成真实的音频文件用于测试
+					ext := filepath.Ext(tt.filePath)
+					var cmd *exec.Cmd
+					switch ext {
+					case ".mp3":
+						cmd = exec.Command("ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+							"-t", "0.1", "-c:a", "libmp3lame", "-b:a", "128k", testFilePath, "-y")
+					case ".wav":
+						cmd = exec.Command("ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+							"-t", "0.1", "-c:a", "pcm_s16le", testFilePath, "-y")
+					}
+					if cmd != nil {
+						if err := cmd.Run(); err != nil {
+							t.Logf("无法生成真实音频文件，使用假文件: %v", err)
+							// 回退：创建假文件
+							if err := os.WriteFile(testFilePath, []byte("test content"), 0644); err != nil {
+								t.Fatalf("创建测试文件失败: %v", err)
+							}
+						}
+					}
+				} else {
+					// 创建一个小的测试文件（假文件）
+					if err := os.WriteFile(testFilePath, []byte("test content"), 0644); err != nil {
+						t.Fatalf("创建测试文件失败: %v", err)
+					}
 				}
 			} else if tt.filePath != "" {
 				testFilePath = filepath.Join(tempDir, tt.filePath)
@@ -135,7 +160,7 @@ func TestMixWithBackgroundMusic_NilOptions(t *testing.T) {
 	voiceAudio := []byte("test voice audio")
 	ctx := context.Background()
 
-	_, err := MixWithBackgroundMusic(ctx, voiceAudio, nil)
+	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", nil)
 	if err == nil {
 		t.Error("MixWithBackgroundMusic() 应该返回错误当选项为 nil")
 	}
@@ -148,7 +173,7 @@ func TestMixWithBackgroundMusic_EmptyMusicPath(t *testing.T) {
 		MusicPath: "",
 	}
 
-	_, err := MixWithBackgroundMusic(ctx, voiceAudio, opts)
+	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", opts)
 	if err == nil {
 		t.Error("MixWithBackgroundMusic() 应该返回错误当音乐路径为空")
 	}
@@ -161,7 +186,7 @@ func TestMixWithBackgroundMusic_NonExistentFile(t *testing.T) {
 		MusicPath: "nonexistent_music.mp3",
 	}
 
-	_, err := MixWithBackgroundMusic(ctx, voiceAudio, opts)
+	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", opts)
 	if err == nil {
 		t.Error("MixWithBackgroundMusic() 应该返回错误当文件不存在")
 	}
@@ -184,27 +209,27 @@ func TestMixWithBackgroundMusic_Integration(t *testing.T) {
 	voiceFile := filepath.Join(tempDir, "voice.mp3")
 	musicFile := filepath.Join(tempDir, "music.mp3")
 
-	// 生成 2 秒静音作为语音
+	// 生成 2 秒音调作为语音（500Hz 正弦波）
 	cmdVoice := exec.Command("ffmpeg",
 		"-f", "lavfi",
-		"-i", "anullsrc=r=24000:cl=mono",
-		"-t", "2",
+		"-i", "sine=frequency=500:duration=2:sample_rate=24000",
 		"-c:a", "libmp3lame",
-		"-b:a", "192k",
+		"-b:a", "48k",
 		voiceFile,
+		"-y",
 	)
 	if err := cmdVoice.Run(); err != nil {
 		t.Skip("无法生成测试音频文件")
 	}
 
-	// 生成 5 秒静音作为背景音乐
+	// 生成 5 秒音调作为背景音乐（300Hz 正弦波）
 	cmdMusic := exec.Command("ffmpeg",
 		"-f", "lavfi",
-		"-i", "anullsrc=r=24000:cl=mono",
-		"-t", "5",
+		"-i", "sine=frequency=300:duration=5:sample_rate=24000",
 		"-c:a", "libmp3lame",
 		"-b:a", "192k",
 		musicFile,
+		"-y",
 	)
 	if err := cmdMusic.Run(); err != nil {
 		t.Skip("无法生成测试音频文件")
@@ -229,7 +254,7 @@ func TestMixWithBackgroundMusic_Integration(t *testing.T) {
 		MainAudioVolume: 1.0,
 	}
 
-	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, opts)
+	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, testProviderEdge, "", opts)
 	if err != nil {
 		t.Fatalf("混音失败: %v", err)
 	}
@@ -301,7 +326,7 @@ func TestDefaultValues(t *testing.T) {
 		// Loop: nil (应该默认为 true)
 	}
 
-	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, opts)
+	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, testProviderEdge, "", opts)
 	if err != nil {
 		t.Fatalf("混音失败: %v", err)
 	}
