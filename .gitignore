@@ -57,3 +57,7 @@ docs/
 bin/
 *.zip
 _upstream/
+
+# Agent work directory
+.agents-work/
+.agents-work/

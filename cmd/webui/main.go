@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +28,17 @@ import (
 var edgeProvider *edgetts.Provider
 var volcProvider *volcengine.Provider
 var cachedVoices map[string][]tts.Voice
+var startupVoicePreloadTimeout = 8 * time.Second
+
+const maxUploadMusicBytes int64 = 50 << 20
+const maxUploadMusicFormMemory int64 = 8 << 20
+const maxSynthesizeJSONBytes int64 = 1 << 20
+
+var cleanupMultipartForm = func(r *http.Request) {
+	if r != nil && r.MultipartForm != nil {
+		_ = r.MultipartForm.RemoveAll()
+	}
+}
 
 // startCleanupTask 启动定期清理任务
 func startCleanupTask() {
@@ -73,24 +89,13 @@ func main() {
 
 	// 预加载语音列表
 	fmt.Println("正在加载语音列表...")
-	ctx := context.Background()
 	cachedVoices = make(map[string][]tts.Voice)
 
 	// 加载 EdgeTTS 语音
-	if voices, err := edgeProvider.ListVoices(ctx, ""); err != nil {
-		log.Printf("⚠️  加载 edgetts 语音列表失败: %v", err)
-	} else {
-		cachedVoices["edgetts"] = voices
-		fmt.Printf("✅ 已加载 edgetts: %d 个语音\n", len(voices))
-	}
+	preloadProviderVoices("edgetts", edgeProvider.ListVoices)
 
 	// 加载 Volcengine 语音
-	if voices, err := volcProvider.ListVoices(ctx, ""); err != nil {
-		log.Printf("⚠️  加载 volcengine 语音列表失败: %v", err)
-	} else {
-		cachedVoices["volcengine"] = voices
-		fmt.Printf("✅ 已加载 volcengine: %d 个语音\n", len(voices))
-	}
+	preloadProviderVoices("volcengine", volcProvider.ListVoices)
 	fmt.Println()
 
 	// 启动定期清理旧的上传文件（每小时清理一次超过24小时的文件）
@@ -100,22 +105,142 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/locales", handleGetLocales)
 	http.HandleFunc("/api/voices", handleGetVoices)
-	http.HandleFunc("/api/synthesize", handleSynthesize)
-	http.HandleFunc("/api/upload-music", handleUploadMusic)
+	http.HandleFunc("/api/synthesize", requireMutationAuth(handleSynthesize))
+	http.HandleFunc("/api/upload-music", requireMutationAuth(handleUploadMusic))
 	http.HandleFunc("/api/check-ffmpeg", handleCheckFFmpeg)
-	http.HandleFunc("/api/install-ffmpeg", handleInstallFFmpeg)
+	http.HandleFunc("/api/install-ffmpeg", requireMutationAuth(handleInstallFFmpeg))
 
 	// 启动服务器
-	port := "8080"
-	fmt.Printf("🚀 服务器启动在: http://localhost:%s\n", port)
+	listenAddr, displayAddr := getServerAddresses()
+	fmt.Printf("🚀 服务器启动在: %s\n", displayAddr)
 	fmt.Println("按 Ctrl+C 停止服务器")
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	server := &http.Server{
+		Addr:              listenAddr,
+		Handler:           nil,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	html := `<!DOCTYPE html>
+func preloadProviderVoices(providerName string, listVoices func(context.Context, string) ([]tts.Voice, error)) {
+	ctx, cancel := context.WithTimeout(context.Background(), startupVoicePreloadTimeout)
+	defer cancel()
+
+	voices, err := listVoices(ctx, "")
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			log.Printf("⚠️  加载 %s 语音列表超时（%s），将以降级模式继续启动", providerName, startupVoicePreloadTimeout)
+			return
+		}
+		log.Printf("⚠️  加载 %s 语音列表失败: %v", providerName, err)
+		return
+	}
+
+	cachedVoices[providerName] = voices
+	fmt.Printf("✅ 已加载 %s: %d 个语音\n", providerName, len(voices))
+}
+
+func getServerAddresses() (listenAddr string, displayAddr string) {
+	host := strings.TrimSpace(os.Getenv("TTSBRIDGE_WEBUI_HOST"))
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	port := strings.TrimSpace(os.Getenv("TTSBRIDGE_WEBUI_PORT"))
+	if port == "" {
+		port = "8080"
+	}
+
+	listenAddr = net.JoinHostPort(host, port)
+	displayHost := host
+	if host == "127.0.0.1" {
+		displayHost = "localhost"
+	}
+	return listenAddr, fmt.Sprintf("http://%s:%s", displayHost, port)
+}
+
+func requireMutationAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimSpace(os.Getenv("TTSBRIDGE_WEBUI_TOKEN"))
+		if token == "" {
+			if !isLoopbackRequest(r) {
+				respondError(w, "未授权访问：远程访问变更接口需配置 TTSBRIDGE_WEBUI_TOKEN", http.StatusForbidden)
+				return
+			}
+			if !isSameOriginRequest(r) {
+				respondError(w, "未授权访问：未配置 token 时仅允许同源本机请求", http.StatusForbidden)
+				return
+			}
+			next(w, r)
+			return
+		}
+
+		provided := strings.TrimSpace(r.Header.Get("X-TTSBridge-Token"))
+		if strings.HasPrefix(provided, "Bearer ") {
+			provided = strings.TrimSpace(strings.TrimPrefix(provided, "Bearer "))
+		}
+		if provided == "" {
+			authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				provided = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+			}
+		}
+
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			respondError(w, "未授权访问", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return strings.EqualFold(strings.TrimSpace(host), "localhost")
+	}
+	return ip.IsLoopback()
+}
+
+func isSameOriginRequest(r *http.Request) bool {
+	requestHost := strings.TrimSpace(r.Host)
+	if requestHost == "" {
+		return false
+	}
+
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" {
+		return originMatchesHost(origin, requestHost)
+	}
+
+	referer := strings.TrimSpace(r.Header.Get("Referer"))
+	if referer != "" {
+		return originMatchesHost(referer, requestHost)
+	}
+
+	return false
+}
+
+func originMatchesHost(rawURL, requestHost string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || strings.TrimSpace(parsed.Host) == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(parsed.Host), requestHost)
+}
+
+const indexPageHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -483,6 +608,11 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         <div class="content">
             <form id="ttsForm">
                 <div class="form-group">
+                    <label for="webuiToken">WebUI Token（可选）</label>
+                    <input type="password" id="webuiToken" placeholder="配置 TTSBRIDGE_WEBUI_TOKEN 时请填写" autocomplete="off">
+                </div>
+
+                <div class="form-group">
                     <label for="provider">选择提供商</label>
                     <select id="provider" required>
                         <option value="edgetts">EdgeTTS (Microsoft 语音)</option>
@@ -613,6 +743,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         const providerSelect = document.getElementById('provider');
         const localeSelect = document.getElementById('locale');
         const voiceSelect = document.getElementById('voice');
+        const webuiTokenInput = document.getElementById('webuiToken');
         const voiceInfo = document.getElementById('voiceInfo');
         const statusDiv = document.getElementById('status');
         const audioPlayer = document.getElementById('audioPlayer');
@@ -627,6 +758,19 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         let isUploading = false;
         let currentBlobUrl = null; // 跟踪当前的 blob URL
         let currentProvider = 'edgetts'; // 当前选择的提供商
+
+        function getMutationAuthHeaders() {
+            const token = webuiTokenInput ? webuiTokenInput.value.trim() : '';
+            if (!token) {
+                return {};
+            }
+            return { 'X-TTSBridge-Token': token };
+        }
+
+        function authFetch(url, init = {}) {
+            const headers = Object.assign({}, init.headers || {}, getMutationAuthHeaders());
+            return fetch(url, Object.assign({}, init, { headers }));
+        }
 
         // 检查 ffmpeg 是否安装
         function checkFFmpeg() {
@@ -654,7 +798,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             btnIcon.textContent = '⏳';
             btnText.textContent = '正在下载安装...';
             
-            fetch('/api/install-ffmpeg', { method: 'POST' })
+            authFetch('/api/install-ffmpeg', { method: 'POST' })
                 .then(res => res.json())
                 .then(data => {
                     if (data.success) {
@@ -831,7 +975,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             formData.append('music', file);
 
             try {
-                const response = await fetch('/api/upload-music', {
+                const response = await authFetch('/api/upload-music', {
                     method: 'POST',
                     body: formData
                 });
@@ -903,7 +1047,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             showStatus('loading', '正在生成语音，请稍候...');
 
             try {
-                const response = await fetch('/api/synthesize', {
+                const response = await authFetch('/api/synthesize', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(requestBody)
@@ -992,8 +1136,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 </body>
 </html>`
 
+func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(html))
+	w.Write([]byte(indexPageHTML))
 }
 
 func handleGetLocales(w http.ResponseWriter, r *http.Request) {
@@ -1166,26 +1311,24 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Text            string  `json:"text"`
-		Voice           string  `json:"voice"`
-		Provider        string  `json:"provider"`
-		Rate            float64 `json:"rate"`
-		Volume          float64 `json:"volume"`
-		Pitch           float64 `json:"pitch"`
-		BackgroundMusic *struct {
-			MusicPath       string  `json:"music_path"`
-			Volume          float64 `json:"volume"`
-			FadeIn          float64 `json:"fade_in"`
-			FadeOut         float64 `json:"fade_out"`
-			StartTime       float64 `json:"start_time"`
-			Loop            bool    `json:"loop"`
-			MainAudioVolume float64 `json:"main_audio_volume"`
-		} `json:"background_music"`
+	r.Body = http.MaxBytesReader(w, r.Body, maxSynthesizeJSONBytes)
+
+	var req synthesizeRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			respondError(w, "请求体过大（最大 1MB）", http.StatusRequestEntityTooLarge)
+			return
+		}
+		respondError(w, "请求数据格式错误: "+err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, "请求数据格式错误: "+err.Error(), http.StatusBadRequest)
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		respondError(w, "请求数据格式错误: 请求体只能包含一个 JSON 对象", http.StatusBadRequest)
 		return
 	}
 
@@ -1198,22 +1341,15 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		req.Provider = "edgetts" // 默认使用 EdgeTTS
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	var audio []byte
 	var err error
 
 	// 构建背景音乐配置（如果有）
-	var bgMusic *tts.BackgroundMusicOptions
-	if req.BackgroundMusic != nil && req.BackgroundMusic.MusicPath != "" {
-		bgMusic = &tts.BackgroundMusicOptions{
-			MusicPath:       req.BackgroundMusic.MusicPath,
-			Volume:          req.BackgroundMusic.Volume,
-			FadeIn:          req.BackgroundMusic.FadeIn,
-			FadeOut:         req.BackgroundMusic.FadeOut,
-			StartTime:       req.BackgroundMusic.StartTime,
-			Loop:            &req.BackgroundMusic.Loop,
-			MainAudioVolume: req.BackgroundMusic.MainAudioVolume,
-		}
+	bgMusic, err := buildBackgroundMusicOptions(req.BackgroundMusic)
+	if err != nil {
+		respondError(w, "背景音乐文件路径非法或文件不存在", http.StatusBadRequest)
+		return
 	}
 
 	// 根据不同的 provider 使用不同的 options
@@ -1270,14 +1406,58 @@ func handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	w.Write(audio)
 }
 
+type backgroundMusicRequest struct {
+	MusicPath       string  `json:"music_path"`
+	Volume          float64 `json:"volume"`
+	FadeIn          float64 `json:"fade_in"`
+	FadeOut         float64 `json:"fade_out"`
+	StartTime       float64 `json:"start_time"`
+	Loop            *bool   `json:"loop"`
+	MainAudioVolume float64 `json:"main_audio_volume"`
+}
+
+type synthesizeRequest struct {
+	Text            string                  `json:"text"`
+	Voice           string                  `json:"voice"`
+	Provider        string                  `json:"provider"`
+	Rate            float64                 `json:"rate"`
+	Volume          float64                 `json:"volume"`
+	Pitch           float64                 `json:"pitch"`
+	BackgroundMusic *backgroundMusicRequest `json:"background_music"`
+}
+
+var buildBackgroundMusicOptions = func(req *backgroundMusicRequest) (*tts.BackgroundMusicOptions, error) {
+	if req == nil || req.MusicPath == "" {
+		return nil, nil
+	}
+
+	validatedMusicPath, err := validateUploadedMusicPath(req.MusicPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tts.BackgroundMusicOptions{
+		MusicPath:       validatedMusicPath,
+		Volume:          req.Volume,
+		FadeIn:          req.FadeIn,
+		FadeOut:         req.FadeOut,
+		StartTime:       req.StartTime,
+		Loop:            req.Loop,
+		MainAudioVolume: req.MainAudioVolume,
+	}, nil
+}
+
 func handleUploadMusic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondError(w, "不允许的请求方法", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 解析 multipart form，最大 50MB
-	if err := r.ParseMultipartForm(50 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadMusicBytes)
+	defer cleanupMultipartForm(r)
+
+	// 解析 multipart form，内存缓冲上限 8MB（总请求体限制仍由 MaxBytesReader 控制为 50MB）
+	if err := r.ParseMultipartForm(maxUploadMusicFormMemory); err != nil {
 		respondError(w, "文件过大（最大 50MB）或解析失败", http.StatusBadRequest)
 		return
 	}
@@ -1289,29 +1469,45 @@ func handleUploadMusic(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// 读取文件内容
-	fileData, err := io.ReadAll(file)
-	if err != nil {
-		respondError(w, "读取文件失败: "+err.Error(), http.StatusInternalServerError)
+	// 先检查扩展名
+	rawFilename := strings.TrimSpace(header.Header.Get("Content-Disposition"))
+	if rawFilename != "" {
+		if _, params, err := mime.ParseMediaType(rawFilename); err == nil {
+			if filename, ok := params["filename"]; ok {
+				filename = strings.TrimSpace(filename)
+				if filepath.IsAbs(filename) || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+					respondError(w, "非法文件名", http.StatusBadRequest)
+					return
+				}
+			}
+		}
+	}
+
+	originalName := strings.TrimSpace(header.Filename)
+	if originalName == "" {
+		respondError(w, "文件名不能为空", http.StatusBadRequest)
+		return
+	}
+	if filepath.IsAbs(originalName) || strings.Contains(originalName, "/") || strings.Contains(originalName, "\\") {
+		respondError(w, "非法文件名", http.StatusBadRequest)
 		return
 	}
 
-	// 先检查扩展名
-	ext := filepath.Ext(header.Filename)
+	ext := strings.ToLower(filepath.Ext(originalName))
 	if !audio.IsSupportedAudioExtension(ext) {
 		respondError(w, "不支持的音频格式: "+ext+"（支持: "+audio.GetSupportedAudioExtensions()+"）", http.StatusBadRequest)
 		return
 	}
 
-	// 使用 audio 包的函数保存文件
-	filePath, err := audio.SaveUploadedFile(fileData, header.Filename)
+	// 流式保存文件（服务端生成随机文件名）
+	filePath, err := saveUploadedMusicStream(file, ext)
 	if err != nil {
 		respondError(w, "保存文件失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// 验证文件格式
-	if err := audio.ValidateBackgroundMusicFile(filePath); err != nil {
+	if err := audio.ValidateBackgroundMusicFileWithContext(r.Context(), filePath); err != nil {
 		// 删除无效文件
 		os.Remove(filePath)
 		respondError(w, "音频文件验证失败: "+err.Error(), http.StatusBadRequest)
@@ -1322,8 +1518,75 @@ func handleUploadMusic(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"path":     filePath,
-		"filename": header.Filename,
+		"filename": originalName,
 	})
+}
+
+func validateUploadedMusicPath(musicPath string) (string, error) {
+	cleanPath := filepath.Clean(strings.TrimSpace(musicPath))
+	if cleanPath == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	baseDir := filepath.Join(os.TempDir(), "ttsbridge_music")
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return "", err
+	}
+
+	baseRealPath := absBaseDir
+	if resolvedBase, err := filepath.EvalSymlinks(absBaseDir); err == nil {
+		baseRealPath = resolvedBase
+	}
+
+	pathReal := absPath
+	if resolvedPath, err := filepath.EvalSymlinks(absPath); err == nil {
+		pathReal = resolvedPath
+	}
+
+	rel, err := filepath.Rel(baseRealPath, pathReal)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path outside upload dir")
+	}
+
+	if info, err := os.Stat(absPath); err != nil || info.IsDir() {
+		return "", fmt.Errorf("invalid file path")
+	}
+
+	return absPath, nil
+}
+
+func saveUploadedMusicStream(src io.Reader, ext string) (string, error) {
+	tempDir := filepath.Join(os.TempDir(), "ttsbridge_music")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("创建临时目录失败: %w", err)
+	}
+
+	tempFile, err := os.CreateTemp(tempDir, "upload_*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	defer tempFile.Close()
+
+	limitedReader := &io.LimitedReader{R: src, N: maxUploadMusicBytes + 1}
+	written, err := io.Copy(tempFile, limitedReader)
+	if err != nil {
+		os.Remove(tempFile.Name())
+		return "", fmt.Errorf("写入文件失败: %w", err)
+	}
+	if written > maxUploadMusicBytes {
+		os.Remove(tempFile.Name())
+		return "", fmt.Errorf("文件过大（最大 50MB）")
+	}
+
+	return tempFile.Name(), nil
 }
 
 func getLocaleName(locale string) string {

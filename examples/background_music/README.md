@@ -34,13 +34,14 @@ go run main.go /path/to/your/music.mp3
 编辑 `main.go` 文件，修改 `BackgroundMusic` 配置：
 
 ```go
+loop := true // nil=默认 true；显式 false 需传指针
 BackgroundMusic: &tts.BackgroundMusicOptions{
     MusicPath:       musicPath,    // 背景音乐文件路径
     Volume:          0.3,           // 背景音乐音量（0.0-1.0）
     FadeIn:          2.0,           // 淡入时长（秒）
     FadeOut:         3.0,           // 淡出时长（秒）
     StartTime:       0.0,           // 起始时间（秒）
-    Loop:            true,          // 是否循环播放
+    Loop:            &loop,         // 是否循环播放
     MainAudioVolume: 1.0,           // 主音频音量（0.0-1.0）
 },
 ```
@@ -50,13 +51,14 @@ BackgroundMusic: &tts.BackgroundMusicOptions{
 ### 场景 1：播客开场白
 
 ```go
+loop := true
 BackgroundMusic: &tts.BackgroundMusicOptions{
     MusicPath:       "intro_music.mp3",
     Volume:          0.4,    // 较高音量
     FadeIn:          1.0,    // 快速淡入
     FadeOut:         2.0,    // 平滑淡出
     StartTime:       0.0,
-    Loop:            true,
+    Loop:            &loop,
     MainAudioVolume: 1.0,
 },
 ```
@@ -64,13 +66,14 @@ BackgroundMusic: &tts.BackgroundMusicOptions{
 ### 场景 2：轻柔背景音
 
 ```go
+loop := true
 BackgroundMusic: &tts.BackgroundMusicOptions{
     MusicPath:       "ambient.mp3",
     Volume:          0.2,    // 很低音量
     FadeIn:          3.0,    // 缓慢淡入
     FadeOut:         4.0,    // 缓慢淡出
     StartTime:       5.0,    // 从第5秒开始
-    Loop:            true,
+    Loop:            &loop,
     MainAudioVolume: 1.0,
 },
 ```
@@ -78,13 +81,14 @@ BackgroundMusic: &tts.BackgroundMusicOptions{
 ### 场景 3：音乐片段（不循环）
 
 ```go
+loop := false
 BackgroundMusic: &tts.BackgroundMusicOptions{
     MusicPath:       "short_clip.mp3",
     Volume:          0.3,
     FadeIn:          0.0,    // 不淡入
     FadeOut:         0.0,    // 不淡出
     StartTime:       0.0,
-    Loop:            false,  // 不循环
+    Loop:            &loop,  // 不循环
     MainAudioVolume: 1.0,
 },
 ```
@@ -139,4 +143,4 @@ ffmpeg -version
 
 ## 更多信息
 
-详细文档请参考：[../docs/背景音乐混音功能.md](../../docs/背景音乐混音功能.md)
+详细文档请参考：[混音音质最佳实践](../../docs/混音音质最佳实践.md)

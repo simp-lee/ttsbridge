@@ -3,6 +3,9 @@ package audio
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,8 +14,9 @@ import (
 	"time"
 
 	"github.com/simp-lee/ttsbridge/tts"
-	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
+
+const validateAudioFormatTimeout = 3 * time.Second
 
 // MixWithBackgroundMusic 将背景音乐混合到语音音频中
 // voiceAudio: 语音音频数据（支持 MP3/WAV 等格式,ffmpeg 会自动识别）
@@ -20,7 +24,11 @@ import (
 // voiceID: TTS voice 标识，便于解析语音音质
 // opts: 背景音乐选项
 // 返回混音后的音频数据
-func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName, voiceID string, opts *tts.BackgroundMusicOptions) ([]byte, error) {
+func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName, voiceID string, opts *tts.BackgroundMusicOptions, profileOverride *tts.VoiceAudioProfile) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// 检查 context 是否已取消
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("操作已取消: %w", err)
@@ -53,13 +61,8 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName
 	optsCopy := *opts
 	opts = &optsCopy
 
-	// 设置默认值
-	if opts.Volume <= 0 {
-		opts.Volume = tts.DefaultBackgroundMusicVolume
-	}
-	if opts.MainAudioVolume <= 0 {
-		opts.MainAudioVolume = tts.DefaultMainAudioVolume
-	}
+	// 设置默认值（仅负值回退默认；显式 0.0 应被保留）
+	applyDefaultMixVolumes(opts)
 	// Loop 默认为 true
 	if opts.Loop == nil {
 		defaultLoop := true
@@ -67,15 +70,21 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName
 	}
 
 	// 获取 TTS 语音的音质配置
-	profile, found := tts.LookupVoiceAudioProfile(providerName, voiceID)
-	if !found {
-		// 如果未找到配置，使用保守的默认值
-		profile = tts.VoiceAudioProfile{
-			Format:     tts.AudioFormatMP3,
-			SampleRate: tts.SampleRate24kHz,
-			Channels:   1,
-			Bitrate:    tts.MP3BitrateBalanced,
-			Lossless:   false,
+	var profile tts.VoiceAudioProfile
+	if profileOverride != nil {
+		profile = *profileOverride
+	} else {
+		var found bool
+		profile, found = tts.LookupVoiceAudioProfile(providerName, voiceID)
+		if !found {
+			// 如果未找到配置，使用保守的默认值
+			profile = tts.VoiceAudioProfile{
+				Format:     tts.AudioFormatMP3,
+				SampleRate: tts.SampleRate24kHz,
+				Channels:   1,
+				Bitrate:    tts.MP3BitrateBalanced,
+				Lossless:   false,
+			}
 		}
 	}
 
@@ -101,7 +110,7 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName
 	outputFile := filepath.Join(tempDir, "mixed."+outputExt)
 
 	// 构建 ffmpeg 混音命令
-	if err := mixAudio(voiceFile, opts.MusicPath, outputFile, opts, &profile); err != nil {
+	if err := mixAudio(ctx, voiceFile, opts.MusicPath, outputFile, opts, &profile); err != nil {
 		return nil, fmt.Errorf("混音失败: %w", err)
 	}
 
@@ -114,10 +123,19 @@ func MixWithBackgroundMusic(ctx context.Context, voiceAudio []byte, providerName
 	return mixedAudio, nil
 }
 
+func applyDefaultMixVolumes(opts *tts.BackgroundMusicOptions) {
+	if opts.Volume < 0 {
+		opts.Volume = tts.DefaultBackgroundMusicVolume
+	}
+	if opts.MainAudioVolume < 0 {
+		opts.MainAudioVolume = tts.DefaultMainAudioVolume
+	}
+}
+
 // mixAudio 执行音频混音
-func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusicOptions, profile *tts.VoiceAudioProfile) error {
+func mixAudio(ctx context.Context, voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusicOptions, profile *tts.VoiceAudioProfile) error {
 	// 获取语音音频时长
-	voiceDuration, err := getAudioDuration(voiceFile)
+	voiceDuration, err := GetAudioDuration(ctx, voiceFile)
 	if err != nil {
 		return fmt.Errorf("获取语音时长失败: %w", err)
 	}
@@ -125,48 +143,44 @@ func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusic
 	// 构建背景音乐滤镜
 	musicFilters := buildMusicFilters(opts, voiceDuration)
 
-	// 使用 ffmpeg-go 构建混音流程
-	voice := ffmpeg.Input(voiceFile)
-	music := ffmpeg.Input(musicFile)
-
-	// 应用主音频音量
-	voiceStream := voice.Audio()
+	// 构建语音滤镜
+	var voiceFilter string
 	if opts.MainAudioVolume != 1.0 {
-		voiceStream = voiceStream.Filter("volume", ffmpeg.Args{fmt.Sprintf("%.2f", opts.MainAudioVolume)})
+		voiceFilter = fmt.Sprintf("[0:a]volume=%.2f[voice]", opts.MainAudioVolume)
+	} else {
+		voiceFilter = "[0:a]acopy[voice]"
 	}
 
-	// 应用背景音乐滤镜
-	musicStream := music.Audio()
-	for _, filter := range musicFilters {
-		musicStream = musicStream.Filter(filter.Name, filter.Args)
+	// 构建背景音乐滤镜链
+	var musicFilterParts []string
+	for _, f := range musicFilters {
+		musicFilterParts = append(musicFilterParts, f.Name+"="+strings.Join(f.Args, ":"))
 	}
+	musicFilter := "[1:a]" + strings.Join(musicFilterParts, ",") + "[music]"
 
-	// 混合两个音频流
-	// 使用 amix 滤镜混音
-	merged := ffmpeg.Filter(
-		[]*ffmpeg.Stream{voiceStream, musicStream},
-		"amix",
-		ffmpeg.Args{
-			"inputs=2",
-			"duration=longest",     // 使用最长的输入作为输出长度
-			"dropout_transition=2", // 平滑的音频过渡
-			"normalize=0",          // 禁用自动归一化，使用手动音量控制以保持更好的动态范围
-		},
-	)
+	// 构建 amix 混音滤镜
+	amixFilter := "[voice][music]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[out]"
 
-	// 根据格式配置输出参数
-	outputKwArgs := buildOutputConfig(profile)
+	filterComplex := voiceFilter + ";" + musicFilter + ";" + amixFilter
 
-	// 输出音频
+	// 构建输出参数
+	outputArgs := buildOutputConfig(profile)
+
+	// 构建完整命令
+	args := []string{
+		"-i", voiceFile,
+		"-i", musicFile,
+		"-filter_complex", filterComplex,
+		"-map", "[out]",
+	}
+	args = append(args, outputArgs...)
+	args = append(args, "-y", outputFile)
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	var errBuf bytes.Buffer
-	err = merged.
-		Output(outputFile, outputKwArgs).
-		OverWriteOutput().
-		WithErrorOutput(&errBuf).
-		Run()
+	cmd.Stderr = &errBuf
 
-	if err != nil {
-		// 将 ffmpeg 的 stderr 输出附加到错误信息中
+	if err := cmd.Run(); err != nil {
 		if errBuf.Len() > 0 {
 			return fmt.Errorf("ffmpeg 执行失败: %w\nffmpeg 输出:\n%s", err, errBuf.String())
 		}
@@ -177,7 +191,7 @@ func mixAudio(voiceFile, musicFile, outputFile string, opts *tts.BackgroundMusic
 }
 
 // buildOutputConfig 根据音质选项构建 ffmpeg 输出配置
-func buildOutputConfig(profile *tts.VoiceAudioProfile) ffmpeg.KwArgs {
+func buildOutputConfig(profile *tts.VoiceAudioProfile) []string {
 	// 确定采样率
 	sampleRate := profile.SampleRate
 	if sampleRate <= 0 {
@@ -203,57 +217,51 @@ func buildOutputConfig(profile *tts.VoiceAudioProfile) ffmpeg.KwArgs {
 		channels = 2
 	}
 
-	config := ffmpeg.KwArgs{
-		"ar": fmt.Sprintf("%d", sampleRate),
-		"ac": fmt.Sprintf("%d", channels),
-	}
+	var args []string
+	args = append(args, "-ar", fmt.Sprintf("%d", sampleRate))
+	args = append(args, "-ac", fmt.Sprintf("%d", channels))
 
 	switch profile.Format {
 	case tts.AudioFormatWAV:
 		// WAV 格式 - 无损，最高音质
-		config["codec:a"] = "pcm_s16le" // 16位 PCM
-		config["f"] = "wav"
+		args = append(args, "-codec:a", "pcm_s16le", "-f", "wav") // 16位 PCM
 
 	case tts.AudioFormatFLAC:
 		// FLAC 格式 - 无损压缩，高音质，文件较小
-		config["codec:a"] = "flac"
-		config["compression_level"] = "8" // 0-12，8是推荐的平衡值
-		config["f"] = "flac"
+		args = append(args, "-codec:a", "flac", "-compression_level", "8", "-f", "flac") // 0-12，8是推荐的平衡值
 
 	case tts.AudioFormatM4A, tts.AudioFormatAAC:
 		// AAC/M4A 格式 - 有损压缩，中高音质，文件小
-		config["codec:a"] = "aac"
-		config["f"] = "mp4" // M4A 使用 MP4 容器
+		args = append(args, "-codec:a", "aac", "-f", "mp4") // M4A 使用 MP4 容器
 		// VBR 质量模式: 0-9，0最高质量
 		if profile.Bitrate > 0 && profile.Bitrate <= 9 {
-			config["q:a"] = fmt.Sprintf("%d", profile.Bitrate)
+			args = append(args, "-q:a", fmt.Sprintf("%d", profile.Bitrate))
 		} else {
-			config["q:a"] = "1" // 默认高质量
+			args = append(args, "-q:a", "1") // 默认高质量
 		}
 
 	case tts.AudioFormatMP3:
 		fallthrough
 	default:
 		// MP3 格式 - 有损压缩，通用性好
-		config["codec:a"] = "libmp3lame"
-		config["f"] = "mp3"
+		args = append(args, "-codec:a", "libmp3lame", "-f", "mp3")
 
 		// 设置比特率（优先保持与 TTS 输出一致）
 		bitrate := profile.Bitrate
 		if bitrate > 0 {
-			config["b:a"] = fmt.Sprintf("%dk", bitrate)
+			args = append(args, "-b:a", fmt.Sprintf("%dk", bitrate))
 		} else {
-			config["q:a"] = "0" // 无明确比特率时退回最高质量
+			args = append(args, "-q:a", "0") // 无明确比特率时退回最高质量
 		}
 	}
 
-	return config
+	return args
 }
 
 // filterConfig 滤镜配置
 type filterConfig struct {
 	Name string
-	Args ffmpeg.Args
+	Args []string
 }
 
 // buildMusicFilters 构建背景音乐滤镜链
@@ -267,7 +275,7 @@ func buildMusicFilters(opts *tts.BackgroundMusicOptions, voiceDuration float64) 
 		// 先使用一个足够大的循环次数，然后用 atrim 裁剪到正确的长度
 		filters = append(filters, filterConfig{
 			Name: "aloop",
-			Args: ffmpeg.Args{
+			Args: []string{
 				"loop=-1", // 无限循环
 				"size=2e+09",
 			},
@@ -285,14 +293,14 @@ func buildMusicFilters(opts *tts.BackgroundMusicOptions, voiceDuration float64) 
 	}
 	filters = append(filters, filterConfig{
 		Name: "atrim",
-		Args: ffmpeg.Args{fmt.Sprintf("duration=%.2f", musicDuration)},
+		Args: []string{fmt.Sprintf("duration=%.2f", musicDuration)},
 	})
 
 	// 淡入效果
 	if opts.FadeIn > 0 {
 		filters = append(filters, filterConfig{
 			Name: "afade",
-			Args: ffmpeg.Args{
+			Args: []string{
 				"t=in",
 				"st=0",
 				fmt.Sprintf("d=%.2f", opts.FadeIn),
@@ -308,7 +316,7 @@ func buildMusicFilters(opts *tts.BackgroundMusicOptions, voiceDuration float64) 
 		}
 		filters = append(filters, filterConfig{
 			Name: "afade",
-			Args: ffmpeg.Args{
+			Args: []string{
 				"t=out",
 				fmt.Sprintf("st=%.2f", fadeOutStart),
 				fmt.Sprintf("d=%.2f", opts.FadeOut),
@@ -319,24 +327,24 @@ func buildMusicFilters(opts *tts.BackgroundMusicOptions, voiceDuration float64) 
 	// 音量调节
 	filters = append(filters, filterConfig{
 		Name: "volume",
-		Args: ffmpeg.Args{fmt.Sprintf("%.2f", opts.Volume)},
+		Args: []string{fmt.Sprintf("%.2f", opts.Volume)},
 	})
 
 	// 如果指定了起始时间，添加延迟效果（在混音前）
 	if opts.StartTime > 0 {
 		filters = append(filters, filterConfig{
 			Name: "adelay",
-			Args: ffmpeg.Args{fmt.Sprintf("delays=%.0f:all=1", opts.StartTime*1000)}, // 转换为毫秒
+			Args: []string{fmt.Sprintf("delays=%.0f:all=1", opts.StartTime*1000)}, // 转换为毫秒
 		})
 	}
 
 	return filters
 }
 
-// getAudioDuration 获取音频文件时长（秒）
-func getAudioDuration(filePath string) (float64, error) {
+// GetAudioDuration 获取音频文件时长（秒）
+func GetAudioDuration(ctx context.Context, filePath string) (float64, error) {
 	// 使用 ffprobe 获取音频时长
-	cmd := exec.Command("ffprobe",
+	cmd := exec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",
@@ -379,6 +387,15 @@ func GetSupportedAudioExtensions() string {
 
 // ValidateBackgroundMusicFile 验证背景音乐文件格式
 func ValidateBackgroundMusicFile(filePath string) error {
+	return ValidateBackgroundMusicFileWithContext(context.Background(), filePath)
+}
+
+// ValidateBackgroundMusicFileWithContext 验证背景音乐文件格式（支持上下文取消与超时）
+func ValidateBackgroundMusicFileWithContext(ctx context.Context, filePath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if filePath == "" {
 		return fmt.Errorf("文件路径不能为空")
 	}
@@ -411,7 +428,7 @@ func ValidateBackgroundMusicFile(filePath string) error {
 
 	// 使用 ffprobe 验证实际的音频格式（如果可用）
 	if IsFFprobeInstalled() {
-		if err := validateAudioFormat(filePath); err != nil {
+		if err := validateAudioFormatWithContext(ctx, filePath); err != nil {
 			return fmt.Errorf("音频文件格式验证失败: %w", err)
 		}
 	}
@@ -419,15 +436,20 @@ func ValidateBackgroundMusicFile(filePath string) error {
 	return nil
 }
 
-// IsFFprobeInstalled 检查 ffprobe 是否已安装
-func IsFFprobeInstalled() bool {
-	cmd := exec.Command("ffprobe", "-version")
-	return cmd.Run() == nil
-}
-
 // validateAudioFormat 使用 ffprobe 验证音频文件格式
 func validateAudioFormat(filePath string) error {
-	cmd := exec.Command("ffprobe",
+	return validateAudioFormatWithContext(context.Background(), filePath)
+}
+
+func validateAudioFormatWithContext(ctx context.Context, filePath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, validateAudioFormatTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(probeCtx, "ffprobe",
 		"-v", "error",
 		"-select_streams", "a:0",
 		"-show_entries", "stream=codec_type",
@@ -437,6 +459,12 @@ func validateAudioFormat(filePath string) error {
 
 	output, err := cmd.Output()
 	if err != nil {
+		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("ffprobe 执行超时（%s），请重试或检查音频文件", validateAudioFormatTimeout)
+		}
+		if errors.Is(probeCtx.Err(), context.Canceled) {
+			return fmt.Errorf("音频格式验证已取消")
+		}
 		return fmt.Errorf("无法解析音频文件，请确保文件格式正确")
 	}
 
@@ -449,33 +477,47 @@ func validateAudioFormat(filePath string) error {
 }
 
 // SaveUploadedFile 保存上传的文件
-// 如果 filename 是完整路径，直接使用；否则保存到临时目录
+// 为兼容旧接口，filename 仅用于提取扩展名，实际文件名由服务端生成
 func SaveUploadedFile(data []byte, filename string) (string, error) {
-	var filePath string
+	ext := strings.ToLower(filepath.Ext(filepath.Base(filename)))
+	return SaveUploadedFileWithExt(data, ext)
+}
 
-	// 如果是绝对路径，直接使用
-	if filepath.IsAbs(filename) {
-		filePath = filename
-		// 确保父目录存在
-		dir := filepath.Dir(filePath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return "", fmt.Errorf("创建目录失败: %w", err)
-		}
-	} else {
-		// 否则保存到临时目录
-		tempDir := filepath.Join(os.TempDir(), "ttsbridge_music")
-		if err := os.MkdirAll(tempDir, 0755); err != nil {
-			return "", fmt.Errorf("创建目录失败: %w", err)
-		}
-		filePath = filepath.Join(tempDir, filepath.Base(filename))
+// SaveUploadedFileWithExt 保存上传文件到受控目录，并由服务端生成随机文件名
+func SaveUploadedFileWithExt(data []byte, ext string) (string, error) {
+	if ext == "" || !strings.HasPrefix(ext, ".") {
+		return "", fmt.Errorf("文件扩展名不能为空")
 	}
 
-	// 写入文件
+	ext = strings.ToLower(ext)
+	if !IsSupportedAudioExtension(ext) {
+		return "", fmt.Errorf("不支持的音频格式: %s（支持的格式: %s）", ext, GetSupportedAudioExtensions())
+	}
+
+	tempDir := filepath.Join(os.TempDir(), "ttsbridge_music")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("创建目录失败: %w", err)
+	}
+
+	randomName, err := randomHex(16)
+	if err != nil {
+		return "", fmt.Errorf("生成文件名失败: %w", err)
+	}
+
+	filePath := filepath.Join(tempDir, randomName+ext)
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		return "", fmt.Errorf("保存文件失败: %w", err)
 	}
 
 	return filePath, nil
+}
+
+func randomHex(byteLen int) (string, error) {
+	b := make([]byte, byteLen)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // CleanupOldFiles 清理指定目录中超过指定时间的文件

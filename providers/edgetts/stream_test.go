@@ -235,43 +235,62 @@ func TestClassifyWebsocketReadError(t *testing.T) {
 	tests := []struct {
 		name         string
 		err          error
+		parentCtxErr error
 		expectedCode string
+		expectRetry  bool
 	}{
 		{
-			name:         "Context取消",
+			name:         "父Context取消",
 			err:          context.Canceled,
-			expectedCode: "", // 应该直接返回原始错误
+			parentCtxErr: context.Canceled,
+			expectedCode: "", // 应该直接返回父context错误
+			expectRetry:  false,
 		},
 		{
-			name:         "Context超时",
+			name:         "父Context超时",
 			err:          context.DeadlineExceeded,
-			expectedCode: "", // 应该直接返回原始错误
+			parentCtxErr: context.DeadlineExceeded,
+			expectedCode: "", // 应该直接返回父context错误
+			expectRetry:  false,
+		},
+		{
+			name:         "内部读取超时应映射为可重试超时错误",
+			err:          context.DeadlineExceeded,
+			parentCtxErr: nil,
+			expectedCode: tts.ErrCodeTimeout,
+			expectRetry:  true,
 		},
 		{
 			name:         "网络超时错误",
 			err:          &mockNetError{timeout: true},
 			expectedCode: tts.ErrCodeTimeout,
+			expectRetry:  true,
 		},
 		{
 			name:         "普通错误",
 			err:          errors.New("connection error"),
 			expectedCode: tts.ErrCodeWebSocketError,
+			expectRetry:  true,
 		},
 		{
 			name:         "IO错误",
 			err:          io.ErrUnexpectedEOF,
 			expectedCode: tts.ErrCodeWebSocketError,
+			expectRetry:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := classifyWebsocketReadError(tt.err, time.Second, "test message")
+			err := classifyWebsocketReadError(tt.err, tt.parentCtxErr, time.Second, "test message")
 
 			if tt.expectedCode == "" {
-				// 应该是原始错误
-				if err != tt.err {
-					t.Errorf("Expected original error, got %v", err)
+				// 应该是父context错误
+				if err != tt.parentCtxErr {
+					t.Errorf("Expected parent context error, got %v", err)
+				}
+				if retryable := tts.IsRetryableError(err); retryable != tt.expectRetry {
+					t.Errorf("Expected retryable=%v, got %v", tt.expectRetry, retryable)
 				}
 				return
 			}
@@ -286,8 +305,50 @@ func TestClassifyWebsocketReadError(t *testing.T) {
 			if ttsErr.Provider != providerName {
 				t.Errorf("Expected provider %s, got %s", providerName, ttsErr.Provider)
 			}
+			if retryable := tts.IsRetryableError(err); retryable != tt.expectRetry {
+				t.Errorf("Expected retryable=%v, got %v", tt.expectRetry, retryable)
+			}
 		})
 	}
+}
+
+func TestEdgeAudioStream_HandleReadError(t *testing.T) {
+	t.Run("partial chunk emitted should fail fast without retry", func(t *testing.T) {
+		stream := &edgeAudioStream{chunkBytesEmitted: 128}
+
+		err := stream.handleReadError(errors.New("connection reset by peer"), time.Second)
+
+		var ttsErr *tts.Error
+		if !errors.As(err, &ttsErr) {
+			t.Fatalf("expected tts.Error, got %T", err)
+		}
+		if ttsErr.Code != tts.ErrCodeInternalError {
+			t.Fatalf("expected code %s, got %s", tts.ErrCodeInternalError, ttsErr.Code)
+		}
+		if !contains(ttsErr.Message, "cannot resume stream after partial chunk emission") {
+			t.Fatalf("unexpected message: %s", ttsErr.Message)
+		}
+		if tts.IsRetryableError(err) {
+			t.Fatalf("expected non-retryable error, got retryable: %v", err)
+		}
+	})
+
+	t.Run("no emitted bytes should keep websocket retry behavior", func(t *testing.T) {
+		stream := &edgeAudioStream{}
+
+		err := stream.handleReadError(errors.New("connection reset by peer"), time.Second)
+
+		var ttsErr *tts.Error
+		if !errors.As(err, &ttsErr) {
+			t.Fatalf("expected tts.Error, got %T", err)
+		}
+		if ttsErr.Code != tts.ErrCodeWebSocketError {
+			t.Fatalf("expected code %s, got %s", tts.ErrCodeWebSocketError, ttsErr.Code)
+		}
+		if !tts.IsRetryableError(err) {
+			t.Fatalf("expected retryable websocket error, got: %v", err)
+		}
+	})
 }
 
 // TestEdgeAudioStream_OffsetCompensation 测试偏移补偿逻辑

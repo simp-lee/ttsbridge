@@ -74,17 +74,8 @@ const (
 	AudioFormatM4A  = "m4a"  // M4A/AAC 格式，高压缩率
 	AudioFormatAAC  = "aac"  // AAC 格式（通常用 M4A 容器）
 
-	// Quality profiles (音质预设)
-	QualityProfileStreaming = "streaming" // 流媒体模式：MP3 192kbps
-	QualityProfileBalanced  = "balanced"  // 平衡模式：MP3 256kbps（推荐默认）
-	QualityProfileHigh      = "high"      // 高音质模式：MP3 320kbps
-	QualityProfileArchival  = "archival"  // 存档模式：FLAC 无损
-
 	// MP3 bitrate presets (kbps)
-	MP3BitrateStreaming = 192 // 流媒体质量
-	MP3BitrateBalanced  = 256 // 平衡质量（新默认）
-	MP3BitrateHigh      = 320 // 最高 MP3 质量
-	MP3BitrateMinimum   = 128 // 最低推荐质量
+	MP3BitrateBalanced = 256 // 平衡质量，混音 fallback 默认值
 
 	// Sample rates (Hz)
 	SampleRate24kHz = 24000 // TTS 常用采样率
@@ -119,6 +110,17 @@ type BackgroundMusicOptions struct {
 
 	// MainAudioVolume 主音频（语音）音量，范围 0.0-1.0，默认 1.0
 	MainAudioVolume float64
+}
+
+// BoundaryEvent 边界事件（词/句边界）
+type BoundaryEvent struct {
+	Type       string        // "WordBoundary" 或 "SentenceBoundary"
+	Text       string        // 边界文本内容
+	Offset     time.Duration // 偏移量（已换算为 time.Duration，原始 100ns 单位）
+	Duration   time.Duration // 持续时长（已换算为 time.Duration，原始 100ns 单位）
+	OffsetMs   int64         // 偏移量（毫秒），方便前端消费者直接使用
+	DurationMs int64         // 持续时长（毫秒），方便前端消费者直接使用
+	ChunkIndex int           // 当前文本块索引（从 0 开始），用于多 chunk 场景下定位
 }
 
 // Voice 语音信息 - 最小公共结构

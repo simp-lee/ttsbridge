@@ -14,19 +14,20 @@ import (
 
 // SynthesizeCmd represents the synthesize subcommand
 type SynthesizeCmd struct {
-	fs          *flag.FlagSet
-	provider    string
-	voice       string
-	text        string
-	file        string
-	out         string
-	stdout      bool
-	rate        string
-	volume      string
-	pitch       string
-	proxy       string
-	httpTimeout time.Duration
-	maxAttempts int
+	fs            *flag.FlagSet
+	provider      string
+	voice         string
+	text          string
+	file          string
+	maxInputBytes int64
+	out           string
+	stdout        bool
+	rate          string
+	volume        string
+	pitch         string
+	proxy         string
+	httpTimeout   time.Duration
+	maxAttempts   int
 }
 
 // NewSynthesizeCmd creates a new synthesize command
@@ -42,6 +43,7 @@ func (c *SynthesizeCmd) resetFlagSet() {
 	c.fs.StringVar(&c.voice, "voice", "", "Voice ID (default per provider)")
 	c.fs.StringVar(&c.text, "text", "", "Input text (conflicts with --file)")
 	c.fs.StringVar(&c.file, "file", "", "Read input text from file; use \"-\" for stdin (conflicts with --text)")
+	c.fs.Int64Var(&c.maxInputBytes, "max-input-bytes", 1<<20, "Max bytes to read from --file/- (stdin); 0 disables the limit")
 	c.fs.StringVar(&c.out, "out", "", "Output file path (optional, auto-generated if omitted)")
 	c.fs.BoolVar(&c.stdout, "stdout", false, "Write audio bytes to stdout")
 	c.fs.StringVar(&c.rate, "rate", "+0%", "Rate adjustment, e.g. \"+50%\" (edgetts only)")
@@ -62,6 +64,7 @@ Flags:
   --voice string          Voice ID (default per provider: edgetts="zh-CN-XiaoxiaoNeural")
   --text string           Input text (conflicts with --file)
   --file string           Read input text from file; use "-" for stdin (conflicts with --text)
+	--max-input-bytes int   Max bytes to read from --file/- (stdin); 0 disables limit (default 1048576)
   --out string            Output file path (optional, auto-generated if omitted)
   --stdout                Write audio bytes to stdout
   --rate string           Rate adjustment, e.g. "+50%" (edgetts only, default "+0%")
@@ -87,6 +90,9 @@ func (c *SynthesizeCmd) Run(args []string, stdoutWriter, stderr io.Writer) error
 			return nil // Help was printed, exit successfully
 		}
 		return &UsageError{Err: err}
+	}
+	if c.maxInputBytes < 0 {
+		return &UsageError{Message: "--max-input-bytes must be >= 0"}
 	}
 
 	cfg := &ProviderConfig{
@@ -228,9 +234,21 @@ func (c *SynthesizeCmd) readInputText() (string, error) {
 		reader = f
 	}
 
-	data, err := io.ReadAll(reader)
+	if c.maxInputBytes == 0 {
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+
+	limitedReader := &io.LimitedReader{R: reader, N: c.maxInputBytes + 1}
+	data, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return "", err
+	}
+	if int64(len(data)) > c.maxInputBytes {
+		return "", &UsageError{Message: fmt.Sprintf("input exceeds --max-input-bytes limit (%d bytes)", c.maxInputBytes)}
 	}
 
 	return string(data), nil

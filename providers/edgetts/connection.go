@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
@@ -43,15 +43,22 @@ func (p *Provider) connect(ctx context.Context) (*websocket.Conn, error) {
 		baseURL, p.clientToken, generateConnectionID(),
 		GenerateSecMsGec(p.clientToken), secMsGecVersion)
 
-	dialer := websocket.Dialer{HandshakeTimeout: p.connectTimeout}
+	dialOpts := &websocket.DialOptions{
+		HTTPHeader:   makeWSHeaders(),
+		Subprotocols: []string{"synthesize"},
+	}
 	if p.proxyURL != "" {
 		if proxyURL, _ := url.Parse(p.proxyURL); proxyURL != nil {
-			dialer.Proxy = http.ProxyURL(proxyURL)
+			dialOpts.HTTPClient = &http.Client{
+				Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+			}
 		}
 	}
 
-	header := makeWSHeaders()
-	conn, resp, err := dialer.DialContext(ctx, wsURL, header)
+	dialCtx, dialCancel := context.WithTimeout(ctx, p.connectTimeout)
+	defer dialCancel()
+
+	conn, resp, err := websocket.Dial(dialCtx, wsURL, dialOpts)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -73,14 +80,12 @@ func (p *Provider) connect(ctx context.Context) (*websocket.Conn, error) {
 
 func makeWSHeaders() http.Header {
 	header := http.Header{
-		"User-Agent":             {fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36 Edg/%s.0.0.0", chromiumMajorVersion, chromiumMajorVersion)},
-		"Accept-Encoding":        {"gzip, deflate, br, zstd"},
-		"Accept-Language":        {"en-US,en;q=0.9"},
-		"Origin":                 {"chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"},
-		"Pragma":                 {"no-cache"},
-		"Cache-Control":          {"no-cache"},
-		"Sec-WebSocket-Protocol": {"synthesize"},
-		"Sec-WebSocket-Version":  {"13"},
+		"User-Agent":      {fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36 Edg/%s.0.0.0", chromiumMajorVersion, chromiumMajorVersion)},
+		"Accept-Encoding": {"gzip, deflate, br, zstd"},
+		"Accept-Language": {"en-US,en;q=0.9"},
+		"Origin":          {"chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"},
+		"Pragma":          {"no-cache"},
+		"Cache-Control":   {"no-cache"},
 	}
 	header.Set("Cookie", makeMUIDCookie())
 	return header
@@ -103,13 +108,18 @@ func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *S
 		sentenceBoundary = "true"
 	}
 
+	outputFormat := defaultOutputFormat
+	if opts.OutputFormat != "" {
+		outputFormat = opts.OutputFormat
+	}
+
 	config := fmt.Sprintf(
 		"X-Timestamp:%s\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n"+
 			`{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"%s","wordBoundaryEnabled":"%s"},"outputFormat":"%s"}}}}`,
-		getTimestamp(), sentenceBoundary, wordBoundary, defaultOutputFormat,
+		getTimestamp(), sentenceBoundary, wordBoundary, outputFormat,
 	)
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(config)); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, []byte(config)); err != nil {
 		return &tts.Error{
 			Code:     tts.ErrCodeWebSocketError,
 			Message:  "failed to send config message",
@@ -135,7 +145,7 @@ func (p *Provider) sendSSML(ctx context.Context, conn *websocket.Conn, opts *Syn
 		generateRequestID(), getTimestamp(), ssml,
 	)
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, []byte(message)); err != nil {
 		return &tts.Error{
 			Code:     tts.ErrCodeWebSocketError,
 			Message:  "failed to send ssml message",
@@ -147,20 +157,11 @@ func (p *Provider) sendSSML(ctx context.Context, conn *websocket.Conn, opts *Syn
 }
 
 // receiveAudio receives audio data and handles metadata
-func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, offsetCompensation int64) ([]byte, error) {
+func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, offsetCompensation int64, chunkIndex int) ([]byte, error) {
 	var audioData []byte
 	audioReceived := false
 
 	receiveTimeout := p.receiveTimeout
-
-	if err := conn.SetReadDeadline(time.Now().Add(receiveTimeout)); err != nil {
-		return nil, &tts.Error{
-			Code:     tts.ErrCodeWebSocketError,
-			Message:  "failed to set read deadline",
-			Provider: providerName,
-			Err:      err,
-		}
-	}
 
 	for {
 		select {
@@ -169,10 +170,13 @@ func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts 
 		default:
 		}
 
-		messageType, message, err := conn.ReadMessage()
+		readCtx, readCancel := context.WithTimeout(ctx, receiveTimeout)
+		messageType, message, err := conn.Read(readCtx)
+		readCancel()
 		if err != nil {
 			// Normal closure without audio is an error
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			var ce websocket.CloseError
+			if errors.As(err, &ce) && ce.Code == websocket.StatusNormalClosure {
 				if !audioReceived {
 					return nil, &tts.Error{
 						Code:     tts.ErrCodeNoAudioReceived,
@@ -182,19 +186,19 @@ func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts 
 				}
 				return audioData, nil
 			}
-			return nil, classifyWebsocketReadError(err, receiveTimeout, "websocket read error while receiving audio")
+			return nil, classifyWebsocketReadError(err, ctx.Err(), receiveTimeout, "websocket read error while receiving audio")
 		}
 
 		switch messageType {
-		case websocket.BinaryMessage:
+		case websocket.MessageBinary:
 			if audioChunk := extractAudioData(message); len(audioChunk) > 0 {
 				audioData = append(audioData, audioChunk...)
 				audioReceived = true
 			}
-		case websocket.TextMessage:
+		case websocket.MessageText:
 			msg := string(message)
-			if opts.MetadataCallback != nil && strings.Contains(msg, "Path:audio.metadata") {
-				p.parseAndCallbackMetadata(message, opts.MetadataCallback, offsetCompensation)
+			if opts.BoundaryCallback != nil && strings.Contains(msg, "Path:audio.metadata") {
+				p.parseAndCallbackMetadata(message, opts.BoundaryCallback, offsetCompensation, chunkIndex)
 			}
 			if strings.Contains(msg, "Path:turn.end") {
 				if !audioReceived {
@@ -211,7 +215,7 @@ func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts 
 }
 
 // parseAndCallbackMetadata parses metadata and invokes callback with offset compensation
-func (p *Provider) parseAndCallbackMetadata(message []byte, callback func(string, int64, int64, string), offsetCompensation int64) {
+func (p *Provider) parseAndCallbackMetadata(message []byte, callback func(tts.BoundaryEvent), offsetCompensation int64, chunkIndex int) {
 	parts := strings.Split(string(message), "\r\n\r\n")
 	if len(parts) < 2 {
 		return
@@ -237,15 +241,31 @@ func (p *Provider) parseAndCallbackMetadata(message []byte, callback func(string
 	for _, meta := range metadata.Metadata {
 		if meta.Type == "WordBoundary" || meta.Type == "SentenceBoundary" {
 			adjustedOffset := meta.Data.Offset + offsetCompensation
-			text := html.UnescapeString(meta.Data.Text.Text)
-			callback(meta.Type, adjustedOffset, meta.Data.Duration, text)
+			event := tts.BoundaryEvent{
+				Type:       meta.Type,
+				Text:       html.UnescapeString(meta.Data.Text.Text),
+				Offset:     time.Duration(adjustedOffset) * 100,
+				Duration:   time.Duration(meta.Data.Duration) * 100,
+				OffsetMs:   adjustedOffset / 10000,
+				DurationMs: meta.Data.Duration / 10000,
+				ChunkIndex: chunkIndex,
+			}
+			callback(event)
 		}
 	}
 }
 
-func classifyWebsocketReadError(err error, receiveTimeout time.Duration, message string) error {
+func classifyWebsocketReadError(err error, parentCtxErr error, receiveTimeout time.Duration, message string) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
+		if errors.Is(parentCtxErr, context.Canceled) || errors.Is(parentCtxErr, context.DeadlineExceeded) {
+			return parentCtxErr
+		}
+		return &tts.Error{
+			Code:     tts.ErrCodeTimeout,
+			Message:  fmt.Sprintf("%s: timeout after %v", message, receiveTimeout),
+			Provider: providerName,
+			Err:      errors.New(err.Error()),
+		}
 	}
 
 	var netErr net.Error
@@ -253,6 +273,16 @@ func classifyWebsocketReadError(err error, receiveTimeout time.Duration, message
 		return &tts.Error{
 			Code:     tts.ErrCodeTimeout,
 			Message:  fmt.Sprintf("%s: timeout after %v", message, receiveTimeout),
+			Provider: providerName,
+			Err:      err,
+		}
+	}
+
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		return &tts.Error{
+			Code:     tts.ErrCodeWebSocketError,
+			Message:  fmt.Sprintf("%s: connection closed with status %d: %s", message, ce.Code, ce.Reason),
 			Provider: providerName,
 			Err:      err,
 		}

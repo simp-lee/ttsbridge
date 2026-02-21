@@ -33,6 +33,8 @@ type SynthesizeOptions struct {
 	// Volcengine 不支持 Rate/Volume/Pitch 参数
 	// 只支持固定的语音和语言
 
+	ProgressCallback func(completed, total int) // 合成进度回调
+
 	// 背景音乐
 	BackgroundMusic *tts.BackgroundMusicOptions
 }
@@ -120,6 +122,16 @@ func (p *Provider) Name() string {
 	return providerName
 }
 
+// FormatRegistry returns the provider's format registry.
+func (p *Provider) FormatRegistry() *tts.FormatRegistry {
+	return defaultFormatRegistry
+}
+
+// SupportedFormats returns all formats verified as available in the registry.
+func (p *Provider) SupportedFormats() []tts.OutputFormat {
+	return defaultFormatRegistry.Available()
+}
+
 // Synthesize 同步合成语音
 func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]byte, error) {
 	if opts == nil || opts.Text == "" {
@@ -147,11 +159,17 @@ func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]b
 
 	// 如果只有一个块，直接返回
 	if len(chunks) == 1 {
-		audio, err := p.synthesizeChunk(ctx, opts)
+		chunkOpts := *opts
+		chunkOpts.Text = chunks[0]
+
+		audio, err := p.synthesizeChunkWithWAVValidation(ctx, &chunkOpts, 0, false)
 		if err != nil {
 			return nil, err
 		}
 		voiceAudio = audio
+		if opts.ProgressCallback != nil {
+			opts.ProgressCallback(1, 1)
+		}
 	} else {
 		// 多个块：收集所有 PCM 数据并重新构建 WAV
 		var pcmData bytes.Buffer
@@ -161,17 +179,12 @@ func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]b
 			chunkOpts := *opts
 			chunkOpts.Text = chunk
 
-			audioChunk, err := p.synthesizeChunk(ctx, &chunkOpts)
+			audioChunk, err := p.synthesizeChunkWithWAVValidation(ctx, &chunkOpts, i, firstHeader != nil)
 			if err != nil {
 				return nil, err
 			}
 
-			if len(audioChunk) < 44 {
-				// 音频数据太短，跳过（异常情况）
-				continue
-			}
-
-			if i == 0 {
+			if firstHeader == nil {
 				// 保存第一个 WAV header（前44字节）
 				firstHeader = make([]byte, 44)
 				copy(firstHeader, audioChunk[:44])
@@ -180,6 +193,13 @@ func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]b
 				// 后续块：跳过 header，只取 PCM 数据
 				pcmData.Write(audioChunk[44:])
 			}
+			if opts.ProgressCallback != nil {
+				opts.ProgressCallback(i+1, len(chunks))
+			}
+		}
+
+		if firstHeader == nil {
+			return nil, &tts.Error{Code: tts.ErrCodeInternalError, Message: "no valid wav chunk header found", Provider: providerName}
 		}
 
 		// 重建 WAV：更新 header 中的文件大小
@@ -187,7 +207,7 @@ func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]b
 	}
 
 	if opts.BackgroundMusic != nil && opts.BackgroundMusic.MusicPath != "" {
-		mixedAudio, err := audio.MixWithBackgroundMusic(ctx, voiceAudio, providerName, opts.Voice, opts.BackgroundMusic)
+		mixedAudio, err := audio.MixWithBackgroundMusic(ctx, voiceAudio, providerName, opts.Voice, opts.BackgroundMusic, nil)
 		if err != nil {
 			return nil, &tts.Error{Code: tts.ErrCodeInternalError, Message: "background music mixing failed", Provider: providerName, Err: err}
 		}
@@ -195,6 +215,27 @@ func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]b
 	}
 
 	return voiceAudio, nil
+}
+
+func (p *Provider) synthesizeChunkWithWAVValidation(ctx context.Context, opts *SynthesizeOptions, chunkIndex int, hasValidChunk bool) ([]byte, error) {
+	audioChunk, err := p.synthesizeChunk(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isValidWAVHeader(audioChunk) {
+		if !hasValidChunk {
+			return nil, &tts.Error{Code: tts.ErrCodeInternalError, Message: "no valid wav chunk header found", Provider: providerName}
+		}
+
+		return nil, &tts.Error{
+			Code:     tts.ErrCodeInternalError,
+			Message:  fmt.Sprintf("invalid wav chunk at index %d: invalid wav header", chunkIndex),
+			Provider: providerName,
+		}
+	}
+
+	return audioChunk, nil
 }
 
 // truncateBody 截断 body 内容用于错误消息（最多 256 字符）
@@ -454,6 +495,17 @@ func (s *audioStream) Read() ([]byte, error) {
 func (s *audioStream) Close() error {
 	s.closed = true
 	return nil
+}
+
+func isValidWAVHeader(chunk []byte) bool {
+	if len(chunk) < 44 {
+		return false
+	}
+
+	return string(chunk[0:4]) == "RIFF" &&
+		string(chunk[8:12]) == "WAVE" &&
+		string(chunk[12:16]) == "fmt " &&
+		string(chunk[36:40]) == "data"
 }
 
 // rebuildWAV 重建 WAV 文件，更新 header 中的数据大小

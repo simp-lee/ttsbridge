@@ -13,8 +13,14 @@ import (
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
-// ListVoices lists available voices for the specified locale
+// ListVoices lists available voices for the specified locale.
+// When voice caching is enabled (via WithVoiceCache), the cached list is used
+// and filtered by locale. Otherwise the list is fetched from the remote API.
 func (p *Provider) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
+	if p.voiceCache != nil {
+		return p.voiceCache.Get(ctx, locale)
+	}
+
 	entries, err := retry.DoWithResult(func() ([]voiceListEntry, error) {
 		return fetchVoiceList(ctx, p.client, p.clientToken)
 	}, tts.RetryOptions(ctx, p.maxAttempts)...)

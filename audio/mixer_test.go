@@ -5,11 +5,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/simp-lee/ttsbridge/tts"
 )
+
+func nilContextForMixerTest() context.Context {
+	var ctx context.Context
+	return ctx
+}
 
 func TestValidateBackgroundMusicFile(t *testing.T) {
 	tests := []struct {
@@ -109,12 +116,17 @@ func TestSaveUploadedFile(t *testing.T) {
 			t.Fatalf("SaveUploadedFile() error = %v", err)
 		}
 
-		// 清理
-		defer os.Remove(savedPath)
-
 		// 验证文件存在
 		if _, err := os.Stat(savedPath); os.IsNotExist(err) {
 			t.Error("文件未创建")
+		}
+
+		if filepath.Dir(savedPath) != filepath.Join(os.TempDir(), "ttsbridge_music") {
+			t.Errorf("文件应保存到受控目录: %v", savedPath)
+		}
+
+		if filepath.Base(savedPath) == filename {
+			t.Errorf("文件名应由服务端生成随机值，不应复用用户文件名: %v", savedPath)
 		}
 
 		// 验证文件内容
@@ -128,7 +140,7 @@ func TestSaveUploadedFile(t *testing.T) {
 		}
 	})
 
-	t.Run("使用绝对路径", func(t *testing.T) {
+	t.Run("使用绝对路径文件名也只能落到受控目录", func(t *testing.T) {
 		tempDir := t.TempDir()
 		filename := "test_music.mp3"
 		fullPath := filepath.Join(tempDir, filename)
@@ -139,9 +151,13 @@ func TestSaveUploadedFile(t *testing.T) {
 			t.Fatalf("SaveUploadedFile() error = %v", err)
 		}
 
-		// 验证返回的路径
-		if savedPath != fullPath {
-			t.Errorf("SaveUploadedFile() path = %v, want %v", savedPath, fullPath)
+		// 验证返回路径不受客户端绝对路径影响
+		if savedPath == fullPath {
+			t.Errorf("不应写入客户端传入的绝对路径: %v", savedPath)
+		}
+
+		if filepath.Dir(savedPath) != filepath.Join(os.TempDir(), "ttsbridge_music") {
+			t.Errorf("文件应保存到受控目录: %v", savedPath)
 		}
 
 		// 验证文件内容
@@ -154,15 +170,40 @@ func TestSaveUploadedFile(t *testing.T) {
 			t.Errorf("文件内容不匹配: got %v, want %v", string(content), string(testData))
 		}
 	})
+
+	t.Run("不支持的扩展名返回错误", func(t *testing.T) {
+		_, err := SaveUploadedFileWithExt(testData, ".txt")
+		if err == nil {
+			t.Fatal("期望返回错误，但得到 nil")
+		}
+	})
 }
 
 func TestMixWithBackgroundMusic_NilOptions(t *testing.T) {
 	voiceAudio := []byte("test voice audio")
 	ctx := context.Background()
 
-	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", nil)
+	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", nil, nil)
 	if err == nil {
 		t.Error("MixWithBackgroundMusic() 应该返回错误当选项为 nil")
+	}
+}
+
+func TestMixWithBackgroundMusic_NilContext_NoPanic(t *testing.T) {
+	voiceAudio := []byte("test voice audio")
+	opts := &tts.BackgroundMusicOptions{
+		MusicPath: "nonexistent_music.mp3",
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("MixWithBackgroundMusic(nil, ...) should not panic, recovered: %v", r)
+		}
+	}()
+
+	_, err := MixWithBackgroundMusic(nilContextForMixerTest(), voiceAudio, testProviderEdge, "", opts, nil)
+	if err == nil {
+		t.Fatal("MixWithBackgroundMusic(nil, ...) should return error")
 	}
 }
 
@@ -173,7 +214,7 @@ func TestMixWithBackgroundMusic_EmptyMusicPath(t *testing.T) {
 		MusicPath: "",
 	}
 
-	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", opts)
+	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", opts, nil)
 	if err == nil {
 		t.Error("MixWithBackgroundMusic() 应该返回错误当音乐路径为空")
 	}
@@ -186,9 +227,41 @@ func TestMixWithBackgroundMusic_NonExistentFile(t *testing.T) {
 		MusicPath: "nonexistent_music.mp3",
 	}
 
-	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", opts)
+	_, err := MixWithBackgroundMusic(ctx, voiceAudio, testProviderEdge, "", opts, nil)
 	if err == nil {
 		t.Error("MixWithBackgroundMusic() 应该返回错误当文件不存在")
+	}
+}
+
+func TestApplyDefaultMixVolumes_ExplicitZeroIsPreserved(t *testing.T) {
+	opts := &tts.BackgroundMusicOptions{
+		Volume:          0.0,
+		MainAudioVolume: 0.0,
+	}
+
+	applyDefaultMixVolumes(opts)
+
+	if opts.Volume != 0.0 {
+		t.Fatalf("背景音量应保留显式 0.0，实际: %v", opts.Volume)
+	}
+	if opts.MainAudioVolume != 0.0 {
+		t.Fatalf("主音频音量应保留显式 0.0，实际: %v", opts.MainAudioVolume)
+	}
+}
+
+func TestApplyDefaultMixVolumes_NegativeValuesFallbackToDefaults(t *testing.T) {
+	opts := &tts.BackgroundMusicOptions{
+		Volume:          -1,
+		MainAudioVolume: -0.5,
+	}
+
+	applyDefaultMixVolumes(opts)
+
+	if opts.Volume != tts.DefaultBackgroundMusicVolume {
+		t.Fatalf("背景音量负值应回退默认值，实际: %v, 期望: %v", opts.Volume, tts.DefaultBackgroundMusicVolume)
+	}
+	if opts.MainAudioVolume != tts.DefaultMainAudioVolume {
+		t.Fatalf("主音频音量负值应回退默认值，实际: %v, 期望: %v", opts.MainAudioVolume, tts.DefaultMainAudioVolume)
 	}
 }
 
@@ -254,7 +327,7 @@ func TestMixWithBackgroundMusic_Integration(t *testing.T) {
 		MainAudioVolume: 1.0,
 	}
 
-	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, testProviderEdge, "", opts)
+	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, testProviderEdge, "", opts, nil)
 	if err != nil {
 		t.Fatalf("混音失败: %v", err)
 	}
@@ -326,7 +399,7 @@ func TestDefaultValues(t *testing.T) {
 		// Loop: nil (应该默认为 true)
 	}
 
-	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, testProviderEdge, "", opts)
+	mixedAudio, err := MixWithBackgroundMusic(ctx, voiceData, testProviderEdge, "", opts, nil)
 	if err != nil {
 		t.Fatalf("混音失败: %v", err)
 	}
@@ -424,5 +497,73 @@ func TestValidateAudioFormat(t *testing.T) {
 	// 测试无效文件
 	if err := validateAudioFormat(textFile); err == nil {
 		t.Error("无效文件应该验证失败")
+	}
+}
+
+func TestValidateAudioFormatTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("跳过测试：当前测试使用 shell 脚本模拟 ffprobe 阻塞")
+	}
+
+	tempDir := t.TempDir()
+	fakeProbe := filepath.Join(tempDir, "ffprobe")
+	script := "#!/bin/sh\nwhile :; do :; done\n"
+	if err := os.WriteFile(fakeProbe, []byte(script), 0755); err != nil {
+		t.Fatalf("创建 fake ffprobe 失败: %v", err)
+	}
+
+	t.Setenv("PATH", tempDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	audioFile := filepath.Join(tempDir, "test.mp3")
+	if err := os.WriteFile(audioFile, []byte("dummy"), 0644); err != nil {
+		t.Fatalf("创建测试文件失败: %v", err)
+	}
+
+	start := time.Now()
+	err := validateAudioFormat(audioFile)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("预期超时错误，实际为 nil（耗时: %v）", elapsed)
+	}
+	if !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("预期错误包含'超时'，实际: %v", err)
+	}
+	if elapsed > 6*time.Second {
+		t.Fatalf("预期在超时后尽快返回，实际耗时过长: %v", elapsed)
+	}
+}
+
+func TestValidateAudioFormatWithContext_Canceled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("跳过测试：当前测试使用 shell 脚本模拟 ffprobe 阻塞")
+	}
+
+	tempDir := t.TempDir()
+	fakeProbe := filepath.Join(tempDir, "ffprobe")
+	script := "#!/bin/sh\nwhile :; do :; done\n"
+	if err := os.WriteFile(fakeProbe, []byte(script), 0755); err != nil {
+		t.Fatalf("创建 fake ffprobe 失败: %v", err)
+	}
+
+	t.Setenv("PATH", tempDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	audioFile := filepath.Join(tempDir, "test.mp3")
+	if err := os.WriteFile(audioFile, []byte("dummy"), 0644); err != nil {
+		t.Fatalf("创建测试文件失败: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		cancel()
+	}()
+
+	err := validateAudioFormatWithContext(ctx, audioFile)
+	if err == nil {
+		t.Fatalf("预期取消错误，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "已取消") {
+		t.Fatalf("预期错误包含'已取消'，实际: %v", err)
 	}
 }

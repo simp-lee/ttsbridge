@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
+	"github.com/simp-lee/ttsbridge/tts"
 )
 
 func main() {
@@ -37,8 +38,8 @@ func main() {
 		Pitch:                   1.0,
 		WordBoundaryEnabled:     true,
 		SentenceBoundaryEnabled: true,
-		MetadataCallback: func(metadataType string, offset int64, duration int64, text string) {
-			switch metadataType {
+		BoundaryCallback: func(event tts.BoundaryEvent) {
+			switch event.Type {
 			case "WordBoundary":
 				wordCount++
 			case "SentenceBoundary":
@@ -46,8 +47,8 @@ func main() {
 			}
 			// 只打印前几个示例
 			if wordCount+sentenceCount <= 5 {
-				fmt.Printf("  [%s] Offset: %d, Duration: %d, Text: %s\n",
-					metadataType, offset, duration, text)
+				fmt.Printf("  [%s] Offset: %dms, Duration: %dms, Text: %s\n",
+					event.Type, event.OffsetMs, event.DurationMs, event.Text)
 			}
 		},
 	}
@@ -80,8 +81,8 @@ func main() {
 		Pitch:                   1.0,
 		WordBoundaryEnabled:     true,
 		SentenceBoundaryEnabled: true,
-		MetadataCallback: func(metadataType string, offset int64, duration int64, text string) {
-			switch metadataType {
+		BoundaryCallback: func(event tts.BoundaryEvent) {
+			switch event.Type {
 			case "WordBoundary":
 				wordCount++
 			case "SentenceBoundary":

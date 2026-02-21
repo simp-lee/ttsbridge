@@ -108,7 +108,7 @@ func TestAudioQualityComparison(t *testing.T) {
 			}
 
 			startTime := time.Now()
-			mixedAudio, err := MixWithBackgroundMusic(ctx, testVoiceAudio, tc.provider, tc.voiceID, opts)
+			mixedAudio, err := MixWithBackgroundMusic(ctx, testVoiceAudio, tc.provider, tc.voiceID, opts, nil)
 			duration := time.Since(startTime)
 
 			if err != nil {
@@ -290,21 +290,32 @@ func TestBuildOutputConfig(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			config := buildOutputConfig(&tc.profile)
-			if config == nil {
+			args := buildOutputConfig(&tc.profile)
+			if args == nil {
 				t.Fatal("buildOutputConfig 返回 nil")
 			}
-			if config["codec:a"] != tc.expectCodec {
-				t.Errorf("编解码器不匹配: got %s, want %s", config["codec:a"], tc.expectCodec)
+
+			// Helper to find value for a flag in args slice
+			findArg := func(flag string) (string, bool) {
+				for i, v := range args {
+					if v == flag && i+1 < len(args) {
+						return args[i+1], true
+					}
+				}
+				return "", false
 			}
-			if config["f"] != tc.expectFormat {
-				t.Errorf("格式不匹配: got %s, want %s", config["f"], tc.expectFormat)
+
+			if codec, ok := findArg("-codec:a"); !ok || codec != tc.expectCodec {
+				t.Errorf("编解码器不匹配: got %s, want %s", codec, tc.expectCodec)
 			}
-			if config["ar"] != tc.expectSampleRate {
-				t.Errorf("采样率不匹配: got %s, want %s", config["ar"], tc.expectSampleRate)
+			if f, ok := findArg("-f"); !ok || f != tc.expectFormat {
+				t.Errorf("格式不匹配: got %s, want %s", f, tc.expectFormat)
 			}
-			if config["ac"] != tc.expectChannels {
-				t.Errorf("声道数不匹配: got %s, want %s", config["ac"], tc.expectChannels)
+			if ar, ok := findArg("-ar"); !ok || ar != tc.expectSampleRate {
+				t.Errorf("采样率不匹配: got %s, want %s", ar, tc.expectSampleRate)
+			}
+			if ac, ok := findArg("-ac"); !ok || ac != tc.expectChannels {
+				t.Errorf("声道数不匹配: got %s, want %s", ac, tc.expectChannels)
 			}
 		})
 	}

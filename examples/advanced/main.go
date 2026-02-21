@@ -20,8 +20,8 @@ func main() {
 	fmt.Println("1. 基本使用")
 	basicUsage()
 
-	// 2. 使用元数据回调获取字幕信息
-	fmt.Println("\n2. 元数据回调演示")
+	// 2. 使用边界事件回调获取字幕信息
+	fmt.Println("\n2. 边界事件回调演示")
 	metadataDemo()
 
 	// 3. 自定义配置（代理、超时等）
@@ -65,7 +65,7 @@ func basicUsage() {
 	fmt.Printf("✓ 合成成功，已保存到 %s (大小: %d 字节)\n", filename, len(audio))
 }
 
-// metadataDemo 元数据回调演示
+// metadataDemo 边界事件回调演示
 func metadataDemo() {
 	provider := edgetts.New()
 
@@ -81,13 +81,13 @@ func metadataDemo() {
 		Text:                "这是第一句话。这是第二句话。这是第三句话。",
 		Voice:               "zh-CN-XiaoxiaoNeural",
 		WordBoundaryEnabled: true, // 启用词边界
-		MetadataCallback: func(metadataType string, offset int64, duration int64, text string) {
+		BoundaryCallback: func(event tts.BoundaryEvent) {
 			// 实时接收词边界信息
-			if metadataType == "WordBoundary" {
+			if event.Type == "WordBoundary" {
 				subtitles = append(subtitles, Subtitle{
-					Text:      text,
-					StartTime: time.Duration(offset) * 100 * time.Nanosecond,
-					EndTime:   time.Duration(offset+duration) * 100 * time.Nanosecond,
+					Text:      event.Text,
+					StartTime: event.Offset,
+					EndTime:   event.Offset + event.Duration,
 				})
 			}
 		},

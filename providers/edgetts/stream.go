@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
 	"github.com/simp-lee/retry"
 	"github.com/simp-lee/ttsbridge/tts"
 )
@@ -23,11 +23,12 @@ type edgeAudioStream struct {
 	textChunks         []string
 	chunkIndex         int
 	offsetCompensation int64
+	chunkBytesEmitted  int
 }
 
 func (s *edgeAudioStream) resetConnection() {
 	if s.conn != nil {
-		s.conn.Close()
+		s.conn.CloseNow()
 		s.conn = nil
 	}
 }
@@ -36,11 +37,13 @@ func (s *edgeAudioStream) nextAudioChunk(receiveTimeout time.Duration) ([]byte, 
 	// Capture current state for potential retry
 	currentChunkIndex := s.chunkIndex
 	currentOffsetCompensation := s.offsetCompensation
+	currentChunkBytesEmitted := s.chunkBytesEmitted
 
 	result, err := retry.DoWithResult(func() ([]byte, error) {
 		// Restore state in case of retry
 		s.chunkIndex = currentChunkIndex
 		s.offsetCompensation = currentOffsetCompensation
+		s.chunkBytesEmitted = currentChunkBytesEmitted
 
 		// Check if all chunks are processed
 		if s.chunkIndex >= len(s.textChunks) {
@@ -61,33 +64,26 @@ func (s *edgeAudioStream) nextAudioChunk(receiveTimeout time.Duration) ([]byte, 
 			default:
 			}
 
-			if err := s.conn.SetReadDeadline(time.Now().Add(receiveTimeout)); err != nil {
-				s.resetConnection()
-				return nil, &tts.Error{
-					Code:     tts.ErrCodeWebSocketError,
-					Message:  "failed to set read deadline",
-					Provider: providerName,
-					Err:      err,
-				}
-			}
-
-			messageType, message, err := s.conn.ReadMessage()
+			readCtx, readCancel := context.WithTimeout(s.ctx, receiveTimeout)
+			messageType, message, err := s.conn.Read(readCtx)
+			readCancel()
 			if err != nil {
-				readErr := classifyWebsocketReadError(err, receiveTimeout, "websocket read error in stream")
+				readErr := s.handleReadError(err, receiveTimeout)
 				s.resetConnection()
 				return nil, readErr
 			}
 
 			switch messageType {
-			case websocket.BinaryMessage:
+			case websocket.MessageBinary:
 				if audioChunk := extractAudioData(message); len(audioChunk) > 0 {
+					s.chunkBytesEmitted += len(audioChunk)
 					return audioChunk, nil
 				}
-			case websocket.TextMessage:
+			case websocket.MessageText:
 				msgStr := string(message)
 
-				if s.opts.MetadataCallback != nil && strings.Contains(msgStr, "Path:audio.metadata") {
-					s.provider.parseAndCallbackMetadata(message, s.opts.MetadataCallback, s.offsetCompensation)
+				if s.opts.BoundaryCallback != nil && strings.Contains(msgStr, "Path:audio.metadata") {
+					s.provider.parseAndCallbackMetadata(message, s.opts.BoundaryCallback, s.offsetCompensation, s.chunkIndex)
 				}
 
 				if strings.Contains(msgStr, "Path:turn.end") {
@@ -95,6 +91,7 @@ func (s *edgeAudioStream) nextAudioChunk(receiveTimeout time.Duration) ([]byte, 
 					// Move to next chunk
 					s.chunkIndex++
 					s.offsetCompensation += defaultOffsetPadding
+					s.chunkBytesEmitted = 0
 
 					// Check if more chunks to process
 					if s.chunkIndex >= len(s.textChunks) {
@@ -112,6 +109,27 @@ func (s *edgeAudioStream) nextAudioChunk(receiveTimeout time.Duration) ([]byte, 
 	}, tts.RetryOptions(s.ctx, s.provider.maxAttempts)...)
 
 	return result, err
+}
+
+func (s *edgeAudioStream) handleReadError(err error, receiveTimeout time.Duration) error {
+	var parentCtxErr error
+	if s.ctx != nil {
+		parentCtxErr = s.ctx.Err()
+	}
+	if errors.Is(parentCtxErr, context.Canceled) || errors.Is(parentCtxErr, context.DeadlineExceeded) {
+		return parentCtxErr
+	}
+
+	if s.chunkBytesEmitted > 0 {
+		return &tts.Error{
+			Code:     tts.ErrCodeInternalError,
+			Message:  "cannot resume stream after partial chunk emission",
+			Provider: providerName,
+			Err:      err,
+		}
+	}
+
+	return classifyWebsocketReadError(err, parentCtxErr, receiveTimeout, "websocket read error in stream")
 }
 
 func (s *edgeAudioStream) Read() ([]byte, error) {
@@ -176,18 +194,18 @@ func (s *edgeAudioStream) initializeChunk() error {
 	}
 
 	if err := s.provider.sendConfig(s.ctx, conn, s.opts); err != nil {
-		conn.Close()
+		conn.CloseNow()
 		return err
 	}
 
 	if err := s.provider.sendSSML(s.ctx, conn, &chunkOpts); err != nil {
-		conn.Close()
+		conn.CloseNow()
 		return err
 	}
 
 	// Close old connection before replacing
 	if s.conn != nil {
-		s.conn.Close()
+		s.conn.CloseNow()
 	}
 	s.conn = conn
 	return nil
@@ -202,7 +220,7 @@ func (s *edgeAudioStream) Close() error {
 	if s.conn == nil {
 		return nil
 	}
-	err := s.conn.Close()
+	err := s.conn.CloseNow()
 	s.conn = nil
 	return err
 }
