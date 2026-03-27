@@ -19,12 +19,12 @@ func main() {
 	example2_SelectOutputFormat(ctx)
 }
 
-// 示例 1: 通过 OutputOptions() 发现可用输出格式
+// 示例 1: 通过 OutputOptions() 查看推荐输出格式目录
 func example1_DiscoverFormats() {
-	fmt.Println("=== 示例 1: 发现可用输出格式 ===")
+	fmt.Println("=== 示例 1: 查看推荐输出格式目录 ===")
 
-	// EdgeTTS: 5 种已验证的输出格式
-	fmt.Println("\nEdgeTTS 支持的输出格式:")
+	// EdgeTTS: OutputOptions 提供推荐目录，不代表当前环境已经 probe 验证。
+	fmt.Println("\nEdgeTTS 推荐输出格式目录:")
 	edgeProvider := edgetts.New()
 	for _, opt := range edgeProvider.OutputOptions() {
 		defaultMark := ""
@@ -33,6 +33,7 @@ func example1_DiscoverFormats() {
 		}
 		fmt.Printf("  %-45s %-25s %s%s\n", opt.FormatID, opt.Label, opt.Description, defaultMark)
 	}
+	fmt.Println("  提示: 如需得到当前环境已验证可用的格式，请先调用 FormatRegistry().ProbeAll(ctx)，再读取 SupportedFormats().")
 
 	// Volcengine: 固定 WAV 无损
 	fmt.Println("\nVolcengine 支持的输出格式:")

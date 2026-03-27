@@ -44,7 +44,6 @@ func NewApp(version, commit, date string) *App {
 	app.registerCommand(NewVoicesCmd())
 	app.registerCommand(NewSynthesizeCmd())
 
-
 	return app
 }
 
@@ -63,6 +62,9 @@ func (a *App) newGlobalFlagSet() *flag.FlagSet {
 }
 
 func (a *App) registerCommand(cmd Command) {
+	if _, exists := a.commands[cmd.Name()]; exists {
+		panic(fmt.Sprintf("command %q already registered", cmd.Name()))
+	}
 	a.commands[cmd.Name()] = cmd
 }
 
@@ -138,7 +140,14 @@ func (a *App) handleError(err error) {
 	var runtimeErr *RuntimeError
 
 	if errors.As(err, &usageErr) {
-		if usageErr.Message != "" {
+		if usageErr.Message != "" && usageErr.Err != nil {
+			if usageErr.Message == usageErr.Err.Error() {
+				fmt.Fprintf(a.stderr, "Error: %s\n", usageErr.Message)
+				a.exitCode = ExitUsageError
+				return
+			}
+			fmt.Fprintf(a.stderr, "Error: %s: %v\n", usageErr.Message, usageErr.Err)
+		} else if usageErr.Message != "" {
 			fmt.Fprintf(a.stderr, "Error: %s\n", usageErr.Message)
 		} else if usageErr.Err != nil {
 			fmt.Fprintf(a.stderr, "Error: %v\n", usageErr.Err)
@@ -148,7 +157,9 @@ func (a *App) handleError(err error) {
 	}
 
 	if errors.As(err, &runtimeErr) {
-		if runtimeErr.Message != "" {
+		if runtimeErr.Message != "" && runtimeErr.Err != nil {
+			fmt.Fprintf(a.stderr, "Error: %s: %v\n", runtimeErr.Message, runtimeErr.Err)
+		} else if runtimeErr.Message != "" {
 			fmt.Fprintf(a.stderr, "Error: %s\n", runtimeErr.Message)
 		} else if runtimeErr.Err != nil {
 			fmt.Fprintf(a.stderr, "Error: %v\n", runtimeErr.Err)

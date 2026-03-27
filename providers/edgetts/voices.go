@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -17,6 +18,10 @@ import (
 // When voice caching is enabled (via WithVoiceCache), the cached list is used
 // and filtered by locale. Otherwise the list is fetched from the remote API.
 func (p *Provider) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
+	ctx = normalizeEdgeTTSContext(ctx)
+	if err := p.runtimeConfigError(); err != nil {
+		return nil, err
+	}
 	if p.voiceCache != nil {
 		return p.voiceCache.Get(ctx, locale)
 	}
@@ -92,11 +97,12 @@ func fetchVoiceList(ctx context.Context, client *http.Client, token string) ([]v
 			Err:      err,
 		}
 	}
-	defer resp.Body.Close()
+	defer closeIgnoreError(resp.Body)
 
 	// Clock skew detection and adjustment on 403 Forbidden
 	if resp.StatusCode == http.StatusForbidden {
-		return nil, handleClockSkewError(resp.Header.Get("Date"))
+		detail := readResponseBody(io.LimitReader(resp.Body, 4096))
+		return nil, classifyForbiddenResponse(resp.Header.Get("Date"), detail)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -210,12 +216,18 @@ func collectLanguages(primary string, secondary []string) []tts.Language {
 }
 
 func matchesLocale(query string, languages []tts.Language) bool {
-	for _, lang := range languages {
-		if strings.HasPrefix(strings.ToLower(string(lang)), query) {
-			return true
-		}
+	if query == "" {
+		return true
 	}
-	return false
+	if len(languages) == 0 {
+		return false
+	}
+
+	voice := tts.Voice{
+		Language:  languages[0],
+		Languages: languages,
+	}
+	return voice.SupportsLanguage(query)
 }
 
 func firstNonEmpty(values ...string) string {

@@ -3,6 +3,7 @@ package tts
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/simp-lee/retry"
@@ -65,62 +66,27 @@ const (
 	GenderNeutral Gender = "Neutral" // 中性
 )
 
-// Audio quality constants for background music mixing
+// Audio format constants
 const (
 	// Output formats
-	AudioFormatMP3  = "mp3"  // MP3 格式，兼容性最好
-	AudioFormatWAV  = "wav"  // WAV 格式，无损但文件大
-	AudioFormatFLAC = "flac" // FLAC 格式，无损压缩
-	AudioFormatM4A  = "m4a"  // M4A/AAC 格式，高压缩率
-	AudioFormatAAC  = "aac"  // AAC 格式（通常用 M4A 容器）
-
-	// MP3 bitrate presets (kbps)
-	MP3BitrateBalanced = 256 // 平衡质量，混音 fallback 默认值
+	AudioFormatMP3 = "mp3" // MP3 格式，兼容性最好
+	AudioFormatPCM = "pcm" // 原始 PCM 音频，无容器封装
+	AudioFormatWAV = "wav" // WAV 格式，无损但文件大
 
 	// Sample rates (Hz)
 	SampleRate24kHz = 24000 // TTS 常用采样率
-	SampleRate44kHz = 44100 // CD 音质采样率
 	SampleRate48kHz = 48000 // 专业音频采样率
-
-	// Default values
-	DefaultBackgroundMusicVolume = 0.3 // 默认背景音乐音量
-	DefaultMainAudioVolume       = 1.0 // 默认主音频音量
 )
-
-// BackgroundMusicOptions 背景音乐混音选项（通用组件）
-type BackgroundMusicOptions struct {
-	// MusicPath 背景音乐文件路径（支持 MP3, WAV, OGG, FLAC 等常见格式）
-	MusicPath string
-
-	// Volume 背景音乐音量，范围 0.0-1.0，默认 0.3
-	Volume float64
-
-	// FadeIn 淡入时长（秒），默认 0（不淡入）
-	FadeIn float64
-
-	// FadeOut 淡出时长（秒），默认 0（不淡出）
-	FadeOut float64
-
-	// StartTime 背景音乐起始时间点（秒），默认 0（从头开始）
-	StartTime float64
-
-	// Loop 是否循环播放背景音乐以覆盖整个语音长度，默认 true
-	// 使用指针类型以便区分"未设置"和"显式设置为 false"
-	Loop *bool
-
-	// MainAudioVolume 主音频（语音）音量，范围 0.0-1.0，默认 1.0
-	MainAudioVolume float64
-}
 
 // BoundaryEvent 边界事件（词/句边界）
 type BoundaryEvent struct {
 	Type       string        // "WordBoundary" 或 "SentenceBoundary"
 	Text       string        // 边界文本内容
-	Offset     time.Duration // 偏移量（已换算为 time.Duration，原始 100ns 单位）
+	Offset     time.Duration // 当前 chunk 内偏移量（已换算为 time.Duration，原始 100ns 单位）
 	Duration   time.Duration // 持续时长（已换算为 time.Duration，原始 100ns 单位）
-	OffsetMs   int64         // 偏移量（毫秒），方便前端消费者直接使用
+	OffsetMs   int64         // 当前 chunk 内偏移量（毫秒），方便前端消费者直接使用
 	DurationMs int64         // 持续时长（毫秒），方便前端消费者直接使用
-	ChunkIndex int           // 当前文本块索引（从 0 开始），用于多 chunk 场景下定位
+	ChunkIndex int           // 当前文本块索引（从 0 开始），用于多 chunk 场景下定位或重建时间轴
 }
 
 // Voice 语音信息 - 最小公共结构
@@ -139,19 +105,49 @@ type Voice struct {
 // SupportsLanguage 检查是否支持指定语言
 // 支持完全匹配或前缀匹配（如 "zh" 匹配 "zh-CN"）
 func (v *Voice) SupportsLanguage(lang string) bool {
-	langStr := string(v.Language)
-	// 检查主语言
-	if langStr == lang || len(langStr) >= len(lang) && langStr[:len(lang)] == lang {
+	lang, ok := normalizeLanguageFilter(lang)
+	if !ok {
+		return false
+	}
+
+	if languageMatchesFilter(v.Language, lang) {
 		return true
 	}
-	// 检查多语言列表
 	for _, l := range v.Languages {
-		lStr := string(l)
-		if lStr == lang || len(lStr) >= len(lang) && lStr[:len(lang)] == lang {
+		if languageMatchesFilter(l, lang) {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizeLanguageFilter(lang string) (string, bool) {
+	lang = strings.ToLower(strings.TrimSpace(lang))
+	if lang == "" {
+		return "", false
+	}
+
+	parts := strings.Split(lang, "-")
+	for index, part := range parts {
+		if part == "" {
+			return "", false
+		}
+		if index == 0 && len(part) < 2 {
+			return "", false
+		}
+		for _, ch := range part {
+			if (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') {
+				return "", false
+			}
+		}
+	}
+
+	return lang, true
+}
+
+func languageMatchesFilter(candidate Language, lang string) bool {
+	candidateStr := strings.ToLower(strings.TrimSpace(string(candidate)))
+	return candidateStr == lang || strings.HasPrefix(candidateStr, lang+"-")
 }
 
 // GetExtra 获取特定类型的扩展信息
@@ -194,9 +190,6 @@ type Provider[T any] interface {
 
 	// ListVoices 列出可用的语音列表
 	ListVoices(ctx context.Context, locale string) ([]Voice, error)
-
-	// IsAvailable 检查提供商是否可用
-	IsAvailable(ctx context.Context) bool
 }
 
 // Error 错误类型

@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
@@ -313,6 +317,26 @@ func TestClassifyWebsocketReadError(t *testing.T) {
 }
 
 func TestEdgeAudioStream_HandleReadError(t *testing.T) {
+	t.Run("boundary emitted should fail fast without retry", func(t *testing.T) {
+		stream := &edgeAudioStream{boundaryEmitted: true}
+
+		err := stream.handleReadError(errors.New("connection reset by peer"), time.Second)
+
+		var ttsErr *tts.Error
+		if !errors.As(err, &ttsErr) {
+			t.Fatalf("expected tts.Error, got %T", err)
+		}
+		if ttsErr.Code != tts.ErrCodeInternalError {
+			t.Fatalf("expected code %s, got %s", tts.ErrCodeInternalError, ttsErr.Code)
+		}
+		if !contains(ttsErr.Message, "cannot retry chunk after boundary callback emission") {
+			t.Fatalf("unexpected message: %s", ttsErr.Message)
+		}
+		if tts.IsRetryableError(err) {
+			t.Fatalf("expected non-retryable error, got retryable: %v", err)
+		}
+	})
+
 	t.Run("partial chunk emitted should fail fast without retry", func(t *testing.T) {
 		stream := &edgeAudioStream{chunkBytesEmitted: 128}
 
@@ -351,40 +375,172 @@ func TestEdgeAudioStream_HandleReadError(t *testing.T) {
 	})
 }
 
-// TestEdgeAudioStream_OffsetCompensation 测试偏移补偿逻辑
-func TestEdgeAudioStream_OffsetCompensation(t *testing.T) {
+func TestParseAndCallbackMetadata_OffsetsRemainChunkLocal(t *testing.T) {
+	provider := New()
+	message := []byte("Path:audio.metadata\r\n\r\n{\"Metadata\":[{\"Type\":\"WordBoundary\",\"Data\":{\"Offset\":12345,\"Duration\":678,\"text\":{\"Text\":\"hello\"}}}]}")
+
+	var events []tts.BoundaryEvent
+	emitted := provider.parseAndCallbackMetadata(message, func(event tts.BoundaryEvent) {
+		events = append(events, event)
+	}, 2)
+
+	if !emitted {
+		t.Fatal("expected metadata callback to emit events")
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %d; want 1", len(events))
+	}
+	if events[0].OffsetMs != 1 {
+		t.Fatalf("OffsetMs = %d; want 1", events[0].OffsetMs)
+	}
+	if events[0].ChunkIndex != 2 {
+		t.Fatalf("ChunkIndex = %d; want 2", events[0].ChunkIndex)
+	}
+	if events[0].Text != "hello" {
+		t.Fatalf("Text = %q; want hello", events[0].Text)
+	}
+}
+
+func TestEdgeAudioStream_TurnEndWithoutAudioReturnsExplicitError(t *testing.T) {
+	conn := newTestWebsocketConn(t, func(ctx context.Context, ws *websocket.Conn) {
+		if err := ws.Write(ctx, websocket.MessageText, []byte("Path:turn.end\r\n\r\n")); err != nil {
+			t.Errorf("write turn.end: %v", err)
+		}
+	})
+
 	stream := &edgeAudioStream{
-		ctx:                context.Background(),
-		textChunks:         []string{"chunk1", "chunk2", "chunk3"},
-		chunkIndex:         0,
-		offsetCompensation: 0,
+		ctx:        context.Background(),
+		textChunks: []string{"chunk1"},
+		chunkIndex: 0,
+		opts:       &SynthesizeOptions{},
+		provider:   &Provider{maxAttempts: 1, receiveTimeout: time.Second},
+		conn:       conn,
 	}
 
-	// 模拟处理第一个 chunk 后的状态变化
-	initialOffset := stream.offsetCompensation
+	_, err := stream.Read()
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
+		t.Fatalf("expected tts.Error, got %T", err)
+	}
+	if ttsErr.Code != tts.ErrCodeNoAudioReceived {
+		t.Fatalf("code = %s; want %s", ttsErr.Code, tts.ErrCodeNoAudioReceived)
+	}
+	if !stream.closed {
+		t.Fatal("stream should be closed after explicit no-audio failure")
+	}
+}
 
-	// 手动模拟 turn.end 处理中的状态更新
-	stream.chunkIndex++
-	stream.offsetCompensation += defaultOffsetPadding
+func TestEdgeAudioStream_MetadataEmissionReturnsExplicitFailure(t *testing.T) {
+	conn := newTestWebsocketConn(t, func(ctx context.Context, ws *websocket.Conn) {
+		metadata := "Path:audio.metadata\r\n\r\n{\"Metadata\":[{\"Type\":\"WordBoundary\",\"Data\":{\"Offset\":20000,\"Duration\":5000,\"text\":{\"Text\":\"hello\"}}}]}"
+		if err := ws.Write(ctx, websocket.MessageText, []byte(metadata)); err != nil {
+			t.Errorf("write metadata: %v", err)
+			return
+		}
+		_ = ws.Close(websocket.StatusInternalError, "boom")
+	})
 
-	expectedOffset := initialOffset + defaultOffsetPadding
-	if stream.offsetCompensation != expectedOffset {
-		t.Errorf("Expected offsetCompensation=%d after first chunk, got %d",
-			expectedOffset, stream.offsetCompensation)
+	callbackCount := 0
+	stream := &edgeAudioStream{
+		ctx:        context.Background(),
+		textChunks: []string{"chunk1"},
+		chunkIndex: 0,
+		opts: &SynthesizeOptions{BoundaryCallback: func(tts.BoundaryEvent) {
+			callbackCount++
+		}},
+		provider: &Provider{maxAttempts: 2, receiveTimeout: time.Second},
+		conn:     conn,
 	}
 
-	// 处理第二个 chunk
-	stream.chunkIndex++
-	stream.offsetCompensation += defaultOffsetPadding
+	_, err := stream.Read()
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
+		t.Fatalf("expected tts.Error, got %T", err)
+	}
+	if ttsErr.Code != tts.ErrCodeInternalError {
+		t.Fatalf("code = %s; want %s", ttsErr.Code, tts.ErrCodeInternalError)
+	}
+	if callbackCount != 1 {
+		t.Fatalf("callback count = %d; want 1", callbackCount)
+	}
+	if tts.IsRetryableError(err) {
+		t.Fatalf("expected non-retryable error, got %v", err)
+	}
+}
 
-	expectedOffset += defaultOffsetPadding
-	if stream.offsetCompensation != expectedOffset {
-		t.Errorf("Expected offsetCompensation=%d after second chunk, got %d",
-			expectedOffset, stream.offsetCompensation)
+func TestEdgeAudioStream_DoesNotReplayCommittedChunkAfterNextChunkInitRetry(t *testing.T) {
+	ctx := context.Background()
+	provider := New().WithMaxAttempts(2)
+	provider.receiveTimeout = time.Second
+
+	connectCalls := 0
+	provider.connectHook = func(context.Context) (*websocket.Conn, error) {
+		connectCalls++
+		if connectCalls == 2 {
+			return nil, &tts.Error{Code: tts.ErrCodeWebSocketError, Message: "transient connect failure", Provider: providerName}
+		}
+
+		return newTestWebsocketConn(t, func(ctx context.Context, ws *websocket.Conn) {
+			_, config, err := ws.Read(ctx)
+			if err != nil {
+				t.Errorf("read config: %v", err)
+				return
+			}
+			_ = config
+
+			_, ssml, err := ws.Read(ctx)
+			if err != nil {
+				t.Errorf("read ssml: %v", err)
+				return
+			}
+
+			payload := []byte("A")
+			if strings.Contains(string(ssml), ">chunk-1<") {
+				payload = []byte("B")
+			}
+
+			message := append([]byte{0x00, 0x00}, payload...)
+			if err := ws.Write(ctx, websocket.MessageBinary, message); err != nil {
+				t.Errorf("write audio: %v", err)
+				return
+			}
+			if err := ws.Write(ctx, websocket.MessageText, []byte("Path:turn.end\r\n\r\n")); err != nil {
+				t.Errorf("write turn.end: %v", err)
+			}
+		}), nil
 	}
 
-	if stream.chunkIndex != 2 {
-		t.Errorf("Expected chunkIndex=2, got %d", stream.chunkIndex)
+	stream := &edgeAudioStream{
+		ctx:        ctx,
+		textChunks: []string{"chunk-0", "chunk-1"},
+		opts: &SynthesizeOptions{
+			Voice: defaultVoice,
+		},
+		provider: provider,
+	}
+
+	first, err := stream.Read()
+	if err != nil {
+		t.Fatalf("first Read() error: %v", err)
+	}
+	if string(first) != "A" {
+		t.Fatalf("first Read() = %q; want %q", string(first), "A")
+	}
+
+	second, err := stream.Read()
+	if err != nil {
+		t.Fatalf("second Read() error: %v", err)
+	}
+	if string(second) != "B" {
+		t.Fatalf("second Read() = %q; want %q", string(second), "B")
+	}
+	if connectCalls != 3 {
+		t.Fatalf("connect call count = %d; want 3", connectCalls)
+	}
+
+	_, err = stream.Read()
+	if err != io.EOF {
+		t.Fatalf("final Read() error = %v; want io.EOF", err)
 	}
 }
 
@@ -464,4 +620,29 @@ func indexInString(s, substr string) int {
 		}
 	}
 	return -1
+}
+
+func newTestWebsocketConn(t *testing.T, handler func(context.Context, *websocket.Conn)) *websocket.Conn {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("websocket accept failed: %v", err)
+			return
+		}
+		defer closeNowIgnoreError(ws)
+		handler(r.Context(), ws)
+	}))
+	t.Cleanup(server.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.Dial(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	t.Cleanup(func() {
+		closeNowIgnoreError(conn)
+	})
+	return conn
 }

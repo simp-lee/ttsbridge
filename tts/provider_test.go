@@ -34,10 +34,6 @@ func (m *mockProvider) ListVoices(ctx context.Context, locale string) ([]tts.Voi
 	}, nil
 }
 
-func (m *mockProvider) IsAvailable(ctx context.Context) bool {
-	return true
-}
-
 func (m *mockProvider) Close() error {
 	return nil
 }
@@ -74,8 +70,4 @@ func TestProviderInterface(t *testing.T) {
 		t.Errorf("Expected voice ID 'mock-voice-1', got '%s'", voices[0].ID)
 	}
 
-	// 测试 IsAvailable
-	if !provider.IsAvailable(ctx) {
-		t.Error("Expected provider to be available")
-	}
 }

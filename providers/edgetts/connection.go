@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,29 +17,143 @@ import (
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
-// handleClockSkewError creates appropriate error for 403 responses with clock skew detection
-func handleClockSkewError(serverDate string) error {
-	if serverDate != "" {
-		// Try to adjust clock skew, always return retryable clock skew error
-		// The adjustment will take effect on next retry attempt
-		_ = AdjustClockSkew(serverDate)
-		return &tts.Error{
-			Code:     tts.ErrCodeClockSkew,
-			Message:  "clock skew detected, adjusted and retrying",
-			Provider: providerName,
+var websocketDial = websocket.Dial
+
+func noAudioReceivedError() error {
+	return &tts.Error{
+		Code:     tts.ErrCodeNoAudioReceived,
+		Message:  "no audio data received",
+		Provider: providerName,
+	}
+}
+
+func boundaryEmissionConflictError(err error) error {
+	return &tts.Error{
+		Code:     tts.ErrCodeInternalError,
+		Message:  "cannot retry chunk after boundary callback emission",
+		Provider: providerName,
+		Err:      err,
+	}
+}
+
+var clockSkewIndicators = []string{
+	"clock skew",
+	"clockskew",
+	"invalid timestamp",
+	"request timestamp",
+	"timestamp expired",
+	"x-timestamp",
+}
+
+var unsupportedOutputFormatIndicators = []string{
+	"unsupported edge output format",
+	"unsupported output format",
+}
+
+const handshakeErrorBodyReadLimit = 4096
+
+func hasClockSkewSignal(detail string) bool {
+	lower := strings.ToLower(strings.TrimSpace(detail))
+	if lower == "" {
+		return false
+	}
+	for _, indicator := range clockSkewIndicators {
+		if strings.Contains(lower, indicator) {
+			return true
 		}
 	}
-	// 403 without Date header - authentication issue, not retryable
+	return false
+}
+
+func hasUnsupportedOutputFormatSignal(detail string) bool {
+	lower := strings.ToLower(strings.TrimSpace(detail))
+	if lower == "" {
+		return false
+	}
+	for _, indicator := range unsupportedOutputFormatIndicators {
+		if strings.Contains(lower, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsupportedOutputFormatDetail(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+
+	var ce websocket.CloseError
+	if errors.As(err, &ce) && hasUnsupportedOutputFormatSignal(ce.Reason) {
+		return strings.TrimSpace(ce.Reason), true
+	}
+
+	if hasUnsupportedOutputFormatSignal(err.Error()) {
+		return strings.TrimSpace(err.Error()), true
+	}
+
+	return "", false
+}
+
+func authFailedError(err error) error {
 	return &tts.Error{
 		Code:     tts.ErrCodeAuthFailed,
 		Message:  "authentication failed",
 		Provider: providerName,
+		Err:      err,
 	}
+}
+
+func classifyForbiddenResponse(serverDate, detail string) error {
+	if !hasClockSkewSignal(detail) {
+		return authFailedError(nil)
+	}
+	if serverDate == "" {
+		return authFailedError(errors.New("clock skew indicated but server date header missing"))
+	}
+	if err := AdjustClockSkew(serverDate); err != nil {
+		return authFailedError(fmt.Errorf("clock skew indicated but failed to parse server date: %w", err))
+	}
+	return &tts.Error{
+		Code:     tts.ErrCodeClockSkew,
+		Message:  "clock skew detected, adjusted and retrying",
+		Provider: providerName,
+	}
+}
+
+func readResponseBody(body io.Reader) string {
+	if body == nil {
+		return ""
+	}
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(payload))
+}
+
+func closeHandshakeResponseBody(resp *http.Response, maxBytes int64) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	var body string
+	if maxBytes > 0 {
+		body = readResponseBody(io.LimitReader(resp.Body, maxBytes))
+	}
+	closeIgnoreError(resp.Body)
+	return body
 }
 
 // connect establishes WebSocket connection with automatic clock skew handling.
 // Returns ErrCodeClockSkew on 403 to signal retry with adjusted clock offset.
 func (p *Provider) connect(ctx context.Context) (*websocket.Conn, error) {
+	if p.connectHook != nil {
+		return p.connectHook(ctx)
+	}
+	if err := p.runtimeConfigError(); err != nil {
+		return nil, err
+	}
+
 	wsURL := fmt.Sprintf(wsURLTemplate,
 		baseURL, p.clientToken, generateConnectionID(),
 		GenerateSecMsGec(p.clientToken), secMsGecVersion)
@@ -58,15 +173,21 @@ func (p *Provider) connect(ctx context.Context) (*websocket.Conn, error) {
 	dialCtx, dialCancel := context.WithTimeout(ctx, p.connectTimeout)
 	defer dialCancel()
 
-	conn, resp, err := websocket.Dial(dialCtx, wsURL, dialOpts)
+	conn, resp, err := websocketDial(dialCtx, wsURL, dialOpts)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
 		// Clock skew detection and adjustment on 403 Forbidden
 		if resp != nil && resp.StatusCode == 403 {
-			return nil, handleClockSkewError(resp.Header.Get("Date"))
+			responseBody := closeHandshakeResponseBody(resp, handshakeErrorBodyReadLimit)
+			detail := err.Error()
+			if responseBody != "" {
+				detail = strings.TrimSpace(detail + "\n" + responseBody)
+			}
+			return nil, classifyForbiddenResponse(resp.Header.Get("Date"), detail)
 		}
+		closeHandshakeResponseBody(resp, 0)
 		return nil, &tts.Error{
 			Code:     tts.ErrCodeWebSocketError,
 			Message:  "websocket connection failed",
@@ -92,7 +213,7 @@ func makeWSHeaders() http.Header {
 }
 
 // sendConfig sends configuration message
-func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions) error {
+func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, allowUndeclaredProbeFormat bool) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -108,9 +229,14 @@ func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *S
 		sentenceBoundary = "true"
 	}
 
-	outputFormat := defaultOutputFormat
-	if opts.OutputFormat != "" {
-		outputFormat = opts.OutputFormat
+	resolveFormat := p.resolveOutputFormat
+	if allowUndeclaredProbeFormat {
+		resolveFormat = p.resolveProbeOutputFormat
+	}
+
+	outputFormat, err := resolveFormat(opts.OutputFormat)
+	if err != nil {
+		return err
 	}
 
 	config := fmt.Sprintf(
@@ -156,10 +282,13 @@ func (p *Provider) sendSSML(ctx context.Context, conn *websocket.Conn, opts *Syn
 	return nil
 }
 
-// receiveAudio receives audio data and handles metadata
-func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, offsetCompensation int64, chunkIndex int) ([]byte, error) {
+// receiveAudio receives audio data and handles metadata.
+// Boundary offsets are chunk-local. Callers should use ChunkIndex to rebuild a
+// cross-chunk timeline if needed.
+func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, chunkIndex int) ([]byte, error) {
 	var audioData []byte
 	audioReceived := false
+	boundaryEmitted := false
 
 	receiveTimeout := p.receiveTimeout
 
@@ -178,13 +307,15 @@ func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts 
 			var ce websocket.CloseError
 			if errors.As(err, &ce) && ce.Code == websocket.StatusNormalClosure {
 				if !audioReceived {
-					return nil, &tts.Error{
-						Code:     tts.ErrCodeNoAudioReceived,
-						Message:  "no audio data received",
-						Provider: providerName,
+					if boundaryEmitted {
+						return nil, boundaryEmissionConflictError(err)
 					}
+					return nil, noAudioReceivedError()
 				}
 				return audioData, nil
+			}
+			if boundaryEmitted {
+				return nil, boundaryEmissionConflictError(err)
 			}
 			return nil, classifyWebsocketReadError(err, ctx.Err(), receiveTimeout, "websocket read error while receiving audio")
 		}
@@ -198,15 +329,16 @@ func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts 
 		case websocket.MessageText:
 			msg := string(message)
 			if opts.BoundaryCallback != nil && strings.Contains(msg, "Path:audio.metadata") {
-				p.parseAndCallbackMetadata(message, opts.BoundaryCallback, offsetCompensation, chunkIndex)
+				if p.parseAndCallbackMetadata(message, opts.BoundaryCallback, chunkIndex) {
+					boundaryEmitted = true
+				}
 			}
 			if strings.Contains(msg, "Path:turn.end") {
 				if !audioReceived {
-					return nil, &tts.Error{
-						Code:     tts.ErrCodeNoAudioReceived,
-						Message:  "no audio data received",
-						Provider: providerName,
+					if boundaryEmitted {
+						return nil, boundaryEmissionConflictError(nil)
 					}
+					return nil, noAudioReceivedError()
 				}
 				return audioData, nil
 			}
@@ -214,11 +346,12 @@ func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts 
 	}
 }
 
-// parseAndCallbackMetadata parses metadata and invokes callback with offset compensation
-func (p *Provider) parseAndCallbackMetadata(message []byte, callback func(tts.BoundaryEvent), offsetCompensation int64, chunkIndex int) {
+// parseAndCallbackMetadata parses metadata and invokes callback.
+// It returns true when at least one boundary event was emitted.
+func (p *Provider) parseAndCallbackMetadata(message []byte, callback func(tts.BoundaryEvent), chunkIndex int) bool {
 	parts := strings.Split(string(message), "\r\n\r\n")
 	if len(parts) < 2 {
-		return
+		return false
 	}
 
 	var metadata struct {
@@ -235,24 +368,26 @@ func (p *Provider) parseAndCallbackMetadata(message []byte, callback func(tts.Bo
 	}
 
 	if err := json.Unmarshal([]byte(parts[1]), &metadata); err != nil {
-		return
+		return false
 	}
 
+	emitted := false
 	for _, meta := range metadata.Metadata {
 		if meta.Type == "WordBoundary" || meta.Type == "SentenceBoundary" {
-			adjustedOffset := meta.Data.Offset + offsetCompensation
 			event := tts.BoundaryEvent{
 				Type:       meta.Type,
 				Text:       html.UnescapeString(meta.Data.Text.Text),
-				Offset:     time.Duration(adjustedOffset) * 100,
+				Offset:     time.Duration(meta.Data.Offset) * 100,
 				Duration:   time.Duration(meta.Data.Duration) * 100,
-				OffsetMs:   adjustedOffset / 10000,
+				OffsetMs:   meta.Data.Offset / 10000,
 				DurationMs: meta.Data.Duration / 10000,
 				ChunkIndex: chunkIndex,
 			}
 			callback(event)
+			emitted = true
 		}
 	}
+	return emitted
 }
 
 func classifyWebsocketReadError(err error, parentCtxErr error, receiveTimeout time.Duration, message string) error {
@@ -265,6 +400,14 @@ func classifyWebsocketReadError(err error, parentCtxErr error, receiveTimeout ti
 			Message:  fmt.Sprintf("%s: timeout after %v", message, receiveTimeout),
 			Provider: providerName,
 			Err:      errors.New(err.Error()),
+		}
+	}
+
+	if detail, ok := unsupportedOutputFormatDetail(err); ok {
+		return &tts.Error{
+			Code:     tts.ErrCodeUnsupportedFormat,
+			Message:  fmt.Sprintf("service rejected output format: %s", detail),
+			Provider: providerName,
 		}
 	}
 

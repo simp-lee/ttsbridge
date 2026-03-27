@@ -2,7 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
@@ -51,12 +54,15 @@ func TestProviderRegistry_DefaultProvidersRegistered(t *testing.T) {
 
 func TestProviderRegistry_RegisterAndGetProvider(t *testing.T) {
 	providerName := "test-provider-registry"
-	RegisterProvider(providerName, func(cfg *ProviderConfig) ProviderAdapter {
+	RegisterProvider(providerName, func(cfg *ProviderConfig) (ProviderAdapter, error) {
 		_ = cfg
-		return &testAdapter{name: providerName}
+		return &testAdapter{name: providerName}, nil
 	})
 
-	adapter := GetProvider(providerName, &ProviderConfig{})
+	adapter, err := GetProvider(providerName, &ProviderConfig{})
+	if err != nil {
+		t.Fatalf("GetProvider(%q) error: %v", providerName, err)
+	}
 	if adapter == nil {
 		t.Fatalf("GetProvider(%q) returned nil", providerName)
 	}
@@ -82,8 +88,76 @@ func TestProviderRegistry_RegisterAndGetProvider(t *testing.T) {
 }
 
 func TestProviderRegistry_GetUnknownProvider(t *testing.T) {
-	if got := GetProvider("provider-that-does-not-exist", nil); got != nil {
+	got, err := GetProvider("provider-that-does-not-exist", nil)
+	if err != nil {
+		t.Fatalf("GetProvider() error = %v, want nil", err)
+	}
+	if got != nil {
 		t.Fatalf("GetProvider() = %#v, want nil for unknown provider", got)
+	}
+}
+
+func TestProviderRegistry_RegisterProviderPanicsOnDuplicateName(t *testing.T) {
+	withTestRegistry(t, map[string]ProviderFactory{})
+
+	providerName := "duplicate-provider"
+	RegisterProvider(providerName, func(cfg *ProviderConfig) (ProviderAdapter, error) {
+		_ = cfg
+		return &testAdapter{name: providerName}, nil
+	})
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("RegisterProvider() expected panic on duplicate provider name")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "already registered") {
+			t.Fatalf("panic = %v, want duplicate registration message", recovered)
+		}
+	}()
+
+	RegisterProvider(providerName, func(cfg *ProviderConfig) (ProviderAdapter, error) {
+		_ = cfg
+		return &testAdapter{name: providerName + "-other"}, nil
+	})
+}
+
+func TestProviderRegistry_GetProviderReturnsFactoryError(t *testing.T) {
+	withTestRegistry(t, map[string]ProviderFactory{
+		"broken": func(cfg *ProviderConfig) (ProviderAdapter, error) {
+			_ = cfg
+			return nil, errors.New("invalid config")
+		},
+	})
+
+	adapter, err := GetProvider("broken", &ProviderConfig{Proxy: "://bad"})
+	if err == nil {
+		t.Fatal("GetProvider() error = nil, want factory error")
+	}
+	if adapter != nil {
+		t.Fatalf("GetProvider() adapter = %#v, want nil on factory error", adapter)
+	}
+}
+
+func TestValidateProxyURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawURL  string
+		wantErr bool
+	}{
+		{name: "empty allowed", rawURL: "", wantErr: false},
+		{name: "valid http", rawURL: "http://127.0.0.1:8080", wantErr: false},
+		{name: "missing scheme and host", rawURL: "bad-proxy", wantErr: true},
+		{name: "parse error", rawURL: "://bad-proxy", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateProxyURL(tt.rawURL)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateProxyURL(%q) error = %v, wantErr %v", tt.rawURL, err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -104,7 +178,10 @@ func TestProviderRegistry_GenericProvidersAndAdaptersRemainCompatible(t *testing
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.providerName, func(t *testing.T) {
-			adapter := GetProvider(tt.providerName, &ProviderConfig{})
+			adapter, err := GetProvider(tt.providerName, &ProviderConfig{})
+			if err != nil {
+				t.Fatalf("GetProvider(%q) error: %v", tt.providerName, err)
+			}
 			if adapter == nil {
 				t.Fatalf("GetProvider(%q) returned nil", tt.providerName)
 			}

@@ -192,7 +192,6 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 		}
 	}
 
-	// 发送请求
 	fmt.Println("\n正在发送请求...")
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -200,9 +199,10 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 		fmt.Printf("❌ 发送请求失败: %v\n", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
-	// 读取响应
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("❌ 读取响应失败: %v\n", err)

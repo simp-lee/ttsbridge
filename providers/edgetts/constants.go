@@ -37,6 +37,5 @@ const (
 
 	defaultOutputFormat  = "audio-24khz-48kbitrate-mono-mp3"
 	defaultMaxSSMLBytes  = 4096
-	defaultOffsetPadding = 8750000                // Average offset compensation (ticks)
 	defaultVoice         = "zh-CN-XiaoxiaoNeural" // Default voice when not specified
 )

@@ -98,6 +98,51 @@ func TestVoiceCache_TTLExpiry(t *testing.T) {
 	}
 }
 
+func TestVoiceCache_EmptyFetchIsCachedUntilTTLExpiry(t *testing.T) {
+	var calls atomic.Int32
+	fetcher := func(ctx context.Context) ([]Voice, error) {
+		calls.Add(1)
+		return []Voice{}, nil
+	}
+
+	cache := NewVoiceCache(fetcher, WithTTL(20*time.Millisecond))
+
+	voices, err := cache.Get(context.Background(), "")
+	if err != nil {
+		t.Fatalf("first Get() error: %v", err)
+	}
+	if len(voices) != 0 {
+		t.Fatalf("first Get() returned %d voices, want 0", len(voices))
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("fetcher called %d times after first Get, want 1", calls.Load())
+	}
+
+	voices, err = cache.Get(context.Background(), "")
+	if err != nil {
+		t.Fatalf("second Get() error: %v", err)
+	}
+	if len(voices) != 0 {
+		t.Fatalf("second Get() returned %d voices, want 0", len(voices))
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("empty successful fetch should be cached, fetcher called %d times", calls.Load())
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	voices, err = cache.Get(context.Background(), "")
+	if err != nil {
+		t.Fatalf("third Get() after TTL expiry error: %v", err)
+	}
+	if len(voices) != 0 {
+		t.Fatalf("third Get() returned %d voices, want 0", len(voices))
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("fetcher called %d times after TTL expiry, want 2", calls.Load())
+	}
+}
+
 func TestVoiceCache_StaleOnError(t *testing.T) {
 	var calls atomic.Int32
 	fetchErr := errors.New("network error")
@@ -160,7 +205,9 @@ func TestVoiceCache_LocaleFilter(t *testing.T) {
 		expected int
 	}{
 		{"all voices", "", 4},
+		{"zh prefix", "zh", 2},
 		{"zh-CN exact", "zh-CN", 2},
+		{"en prefix", "en", 2},
 		{"en-US exact", "en-US", 2}, // Jenny (Language) + Nanami (Languages includes en-US)
 		{"ja-JP exact", "ja-JP", 1},
 		{"case insensitive", "ZH-CN", 2},
@@ -175,6 +222,61 @@ func TestVoiceCache_LocaleFilter(t *testing.T) {
 			}
 			if len(voices) != tt.expected {
 				t.Errorf("got %d voices for locale %q, want %d", len(voices), tt.locale, tt.expected)
+			}
+		})
+	}
+}
+
+func TestVoiceCache_LocaleFilterRejectsInvalidLocalePrefixes(t *testing.T) {
+	fetcher := func(ctx context.Context) ([]Voice, error) {
+		return testVoices(), nil
+	}
+
+	cache := NewVoiceCache(fetcher)
+
+	for _, locale := range []string{"e", "z", "en-", "zh-"} {
+		t.Run(locale, func(t *testing.T) {
+			voices, err := cache.Get(context.Background(), locale)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(voices) != 0 {
+				t.Fatalf("Get(%q) returned %d voices, want 0", locale, len(voices))
+			}
+		})
+	}
+}
+
+func TestVoiceCache_LocaleFilterMatchesSupportsLanguageSemantics(t *testing.T) {
+	fetcher := func(ctx context.Context) ([]Voice, error) {
+		return testVoices(), nil
+	}
+
+	cache := NewVoiceCache(fetcher)
+	voices := testVoices()
+	locales := []string{"zh", "zh-CN", "en", "en-US", "ja", "ja-JP", "e", "en-", "zh-", "fr-FR"}
+
+	for _, locale := range locales {
+		t.Run(locale, func(t *testing.T) {
+			got, err := cache.Get(context.Background(), locale)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			wantIDs := make([]string, 0)
+			for i := range voices {
+				if voices[i].SupportsLanguage(locale) {
+					wantIDs = append(wantIDs, voices[i].ID)
+				}
+			}
+
+			if len(got) != len(wantIDs) {
+				t.Fatalf("Get(%q) returned %d voices, want %d", locale, len(got), len(wantIDs))
+			}
+			for i, voice := range got {
+				if voice.ID != wantIDs[i] {
+					t.Fatalf("Get(%q) voice[%d]=%q, want %q", locale, i, voice.ID, wantIDs[i])
+				}
 			}
 		})
 	}
@@ -228,7 +330,11 @@ func TestVoiceCache_BackgroundRefresh(t *testing.T) {
 	}
 
 	cache := NewVoiceCache(fetcher, WithTTL(time.Hour), WithBackgroundRefresh(20*time.Millisecond))
-	defer cache.Stop()
+	t.Cleanup(func() {
+		if err := cache.Stop(); err != nil {
+			t.Fatalf("Stop() error: %v", err)
+		}
+	})
 
 	// First call to populate
 	_, err := cache.Get(context.Background(), "")
@@ -261,7 +367,9 @@ func TestVoiceCache_Stop(t *testing.T) {
 
 	// Let background refresh run a bit
 	time.Sleep(30 * time.Millisecond)
-	cache.Stop()
+	if err := cache.Stop(); err != nil {
+		t.Fatalf("Stop() error: %v", err)
+	}
 
 	countAfterStop := calls.Load()
 
@@ -281,8 +389,12 @@ func TestVoiceCache_StopIdempotent(t *testing.T) {
 	_, _ = cache.Get(context.Background(), "")
 
 	// Multiple Stop calls should not panic
-	cache.Stop()
-	cache.Stop()
+	if err := cache.Stop(); err != nil {
+		t.Fatalf("first Stop() error: %v", err)
+	}
+	if err := cache.Stop(); err != nil {
+		t.Fatalf("second Stop() error: %v", err)
+	}
 }
 
 func TestVoiceCache_StopWithoutBackgroundRefresh(t *testing.T) {
@@ -293,10 +405,12 @@ func TestVoiceCache_StopWithoutBackgroundRefresh(t *testing.T) {
 	cache := NewVoiceCache(fetcher)
 
 	// Stop on a cache without background refresh should not panic
-	cache.Stop()
+	if err := cache.Stop(); err != nil {
+		t.Fatalf("Stop() error: %v", err)
+	}
 }
 
-func TestVoiceCache_Stop_BoundedWhenBackgroundFetcherIgnoresCancel(t *testing.T) {
+func TestVoiceCache_Stop_ReturnsErrorWhenBackgroundFetcherIgnoresCancel(t *testing.T) {
 	started := make(chan struct{}, 1)
 	hang := make(chan struct{})
 
@@ -310,6 +424,14 @@ func TestVoiceCache_Stop_BoundedWhenBackgroundFetcherIgnoresCancel(t *testing.T)
 	}
 
 	cache := NewVoiceCache(fetcher, WithBackgroundRefresh(10*time.Millisecond))
+	t.Cleanup(func() {
+		close(hang)
+		select {
+		case <-cache.done:
+		case <-time.After(200 * time.Millisecond):
+			t.Errorf("background refresh goroutine did not exit after releasing fetcher")
+		}
+	})
 
 	select {
 	case <-started:
@@ -318,14 +440,17 @@ func TestVoiceCache_Stop_BoundedWhenBackgroundFetcherIgnoresCancel(t *testing.T)
 	}
 
 	stopped := make(chan struct{})
+	var stopErr error
 	go func() {
-		cache.Stop()
+		stopErr = cache.Stop()
 		close(stopped)
 	}()
 
 	select {
 	case <-stopped:
-		// expected: Stop should be bounded even if fetcher hangs
+		if stopErr == nil {
+			t.Fatal("expected Stop() to report timeout when background fetcher does not exit")
+		}
 	case <-time.After(400 * time.Millisecond):
 		t.Fatal("Stop() blocked indefinitely with hanging background fetcher")
 	}
@@ -409,6 +534,83 @@ func TestVoiceCache_FindCached_Hit(t *testing.T) {
 	}
 	if voice.ID != "zh-CN-XiaoxiaoNeural" {
 		t.Errorf("voice.ID = %q, want %q", voice.ID, "zh-CN-XiaoxiaoNeural")
+	}
+}
+
+func TestVoiceCache_ReturnsDeepCopies(t *testing.T) {
+	voicesWithExtra := []Voice{
+		{
+			ID:        "zh-CN-XiaoxiaoNeural",
+			Name:      "Xiaoxiao",
+			Language:  "zh-CN",
+			Languages: []Language{"zh-CN", "en-US"},
+			Gender:    GenderFemale,
+			Provider:  "edgetts",
+			Extra: &testExtra{
+				Status: "GA",
+				Styles: []string{"cheerful"},
+			},
+		},
+	}
+
+	cache := NewVoiceCache(func(ctx context.Context) ([]Voice, error) {
+		return voicesWithExtra, nil
+	})
+
+	got, err := cache.Get(context.Background(), "zh")
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(Get()) = %d, want 1", len(got))
+	}
+
+	got[0].Languages[0] = "fr-FR"
+	extra, ok := GetExtra[*testExtra](&got[0])
+	if !ok {
+		t.Fatalf("GetExtra() failed for cloned voice")
+	}
+	extra.Status = "Preview"
+	extra.Styles[0] = "sad"
+
+	again, err := cache.Get(context.Background(), "zh")
+	if err != nil {
+		t.Fatalf("second Get() error: %v", err)
+	}
+	if again[0].Languages[0] != "zh-CN" {
+		t.Fatalf("cached Languages mutated: got %q, want %q", again[0].Languages[0], "zh-CN")
+	}
+	againExtra, ok := GetExtra[*testExtra](&again[0])
+	if !ok {
+		t.Fatalf("GetExtra() failed for second Get result")
+	}
+	if againExtra.Status != "GA" {
+		t.Fatalf("cached Extra.Status mutated: got %q, want %q", againExtra.Status, "GA")
+	}
+	if againExtra.Styles[0] != "cheerful" {
+		t.Fatalf("cached Extra.Styles mutated: got %q, want %q", againExtra.Styles[0], "cheerful")
+	}
+
+	fromFind, ok := cache.FindCached("zh-CN-XiaoxiaoNeural")
+	if !ok {
+		t.Fatal("FindCached() should return cloned voice")
+	}
+	findExtra, ok := GetExtra[*testExtra](&fromFind)
+	if !ok {
+		t.Fatalf("GetExtra() failed for FindCached result")
+	}
+	findExtra.Status = "Retired"
+
+	finalVoice, ok := cache.FindCached("zh-CN-XiaoxiaoNeural")
+	if !ok {
+		t.Fatal("FindCached() should still find voice")
+	}
+	finalExtra, ok := GetExtra[*testExtra](&finalVoice)
+	if !ok {
+		t.Fatalf("GetExtra() failed for final FindCached result")
+	}
+	if finalExtra.Status != "GA" {
+		t.Fatalf("FindCached exposed mutable Extra: got %q, want %q", finalExtra.Status, "GA")
 	}
 }
 

@@ -51,6 +51,10 @@ func (e *FallbackError) Unwrap() error {
 // SynthesizeWithFallback tries providers in order and returns on first success.
 // When all providers fail, it returns a FallbackError containing provider-level failures.
 func SynthesizeWithFallback[T any](ctx context.Context, opts T, providers ...Provider[T]) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if len(providers) == 0 {
 		return nil, errFallbackChainEmpty
 	}
@@ -67,13 +71,7 @@ func SynthesizeWithFallback[T any](ctx context.Context, opts T, providers ...Pro
 		}
 
 		if err := ctx.Err(); err != nil {
-			failures = append(failures, ProviderFailure{Provider: providerName, Err: err})
-			return nil, newFallbackError(failures)
-		}
-
-		if !provider.IsAvailable(ctx) {
-			failures = append(failures, ProviderFailure{Provider: providerName, Err: errors.New("provider unavailable")})
-			continue
+			return nil, err
 		}
 
 		audio, err := provider.Synthesize(ctx, opts)

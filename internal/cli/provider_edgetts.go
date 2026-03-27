@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
 	"github.com/simp-lee/ttsbridge/tts"
@@ -21,23 +22,27 @@ type edgeTTSAdapter struct {
 	provider *edgetts.Provider
 }
 
-func newEdgeTTSAdapter(cfg *ProviderConfig) ProviderAdapter {
+func newEdgeTTSAdapter(cfg *ProviderConfig) (ProviderAdapter, error) {
 	p := edgetts.New()
 
 	if cfg != nil {
 		if cfg.Proxy != "" {
+			if err := validateProxyURL(cfg.Proxy); err != nil {
+				return nil, fmt.Errorf("edgetts proxy: %w", err)
+			}
 			p.WithProxy(cfg.Proxy)
 		}
 		if cfg.HTTPTimeout > 0 {
 			p.WithHTTPTimeout(cfg.HTTPTimeout)
 			p.WithConnectTimeout(cfg.HTTPTimeout)
+			p.WithReceiveTimeout(cfg.HTTPTimeout)
 		}
 		if cfg.MaxAttempts > 0 {
 			p.WithMaxAttempts(cfg.MaxAttempts)
 		}
 	}
 
-	return &edgeTTSAdapter{provider: p}
+	return &edgeTTSAdapter{provider: p}, nil
 }
 
 func (a *edgeTTSAdapter) Name() string {

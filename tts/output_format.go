@@ -3,6 +3,7 @@ package tts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -50,6 +51,7 @@ type FormatProber interface {
 type FormatRegistry struct {
 	mu            sync.RWMutex
 	formats       map[string]*OutputFormat
+	declared      map[string]struct{}
 	prober        FormatProber
 	parser        func(string) (VoiceAudioProfile, bool)
 	probeTTL      time.Duration
@@ -76,17 +78,23 @@ func WithProfileParser(fn func(string) (VoiceAudioProfile, bool)) FormatRegistry
 }
 
 // WithProbeTTL sets the time-to-live for probe results. Default is 7 days.
+// Non-positive values are ignored to preserve the default cache contract.
 func WithProbeTTL(d time.Duration) FormatRegistryOption {
 	return func(r *FormatRegistry) {
-		r.probeTTL = d
+		if d > 0 {
+			r.probeTTL = d
+		}
 	}
 }
 
 // WithProbeInterval sets the delay between individual format probes in
-// ProbeAll. Default is 2 seconds (to avoid rate limiting).
+// ProbeAll. Default is 2 seconds (to avoid rate limiting). Non-positive values
+// are ignored to preserve the default pacing contract.
 func WithProbeInterval(d time.Duration) FormatRegistryOption {
 	return func(r *FormatRegistry) {
-		r.probeInterval = d
+		if d > 0 {
+			r.probeInterval = d
+		}
 	}
 }
 
@@ -94,6 +102,7 @@ func WithProbeInterval(d time.Duration) FormatRegistryOption {
 func NewFormatRegistry(opts ...FormatRegistryOption) *FormatRegistry {
 	r := &FormatRegistry{
 		formats:       make(map[string]*OutputFormat),
+		declared:      make(map[string]struct{}),
 		probeTTL:      defaultProbeTTL,
 		probeInterval: defaultProbeInterval,
 	}
@@ -111,6 +120,9 @@ func (r *FormatRegistry) Register(formats ...OutputFormat) {
 	for i := range formats {
 		f := formats[i] // copy
 		r.formats[f.ID] = &f
+		if f.ID != "" {
+			r.declared[f.ID] = struct{}{}
+		}
 	}
 }
 
@@ -125,6 +137,7 @@ func (r *FormatRegistry) RegisterConstant(id string, profile VoiceAudioProfile) 
 		Status:     FormatAvailable,
 		VerifiedAt: constantVerifiedAt,
 	}
+	r.declared[id] = struct{}{}
 }
 
 // Get retrieves a format by ID. If the format is not registered but a parser
@@ -201,6 +214,36 @@ func (r *FormatRegistry) All() []OutputFormat {
 	return result
 }
 
+// Declared returns formats explicitly registered through Register or
+// RegisterConstant, sorted by ID. Auto-parsed and auto-probed entries are not
+// included.
+func (r *FormatRegistry) Declared() []OutputFormat {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make([]OutputFormat, 0, len(r.declared))
+	for id := range r.declared {
+		f := r.formats[id]
+		if f == nil {
+			continue
+		}
+		result = append(result, *f)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
+	return result
+}
+
+// IsDeclared reports whether the format ID was explicitly registered through
+// Register or RegisterConstant.
+func (r *FormatRegistry) IsDeclared(formatID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.declared[formatID]
+	return ok
+}
+
 // Probe probes a single format and updates the registry with the result.
 //
 // Behavior:
@@ -210,6 +253,10 @@ func (r *FormatRegistry) All() []OutputFormat {
 //   - If the format is not yet registered, it is auto-registered.
 //   - Returns an error if no prober is configured.
 func (r *FormatRegistry) Probe(ctx context.Context, formatID string) (*OutputFormat, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	r.mu.RLock()
 	prober := r.prober
 	parser := r.parser
@@ -226,8 +273,8 @@ func (r *FormatRegistry) Probe(ctx context.Context, formatID string) (*OutputFor
 		return &fCopy, nil
 	}
 
-	// Return cached result if available and not expired
-	if found && fCopy.Status == FormatAvailable && !fCopy.VerifiedAt.IsZero() &&
+	// Return cached verified result if available and not expired.
+	if found && isVerifiedProbeStatus(fCopy.Status) && !fCopy.VerifiedAt.IsZero() &&
 		time.Since(fCopy.VerifiedAt) < probeTTL {
 		return &fCopy, nil
 	}
@@ -279,8 +326,13 @@ func (r *FormatRegistry) Probe(ctx context.Context, formatID string) (*OutputFor
 // ProbeAll probes all FormatUnverified formats in the registry.
 // It returns counts of newly available and unavailable formats.
 // Formats are probed sequentially with the configured probe interval to avoid
-// rate limiting. Returns early if the context is cancelled.
+// rate limiting. Returns early if the context is cancelled. Probe errors are
+// returned separately and are not counted as unavailable results.
 func (r *FormatRegistry) ProbeAll(ctx context.Context) (available, unavailable int, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Snapshot unverified format IDs
 	r.mu.RLock()
 	var ids []string
@@ -293,6 +345,7 @@ func (r *FormatRegistry) ProbeAll(ctx context.Context) (available, unavailable i
 	r.mu.RUnlock()
 
 	sort.Strings(ids) // deterministic order
+	var probeErrors []error
 
 	for i, id := range ids {
 		// Respect context cancellation
@@ -302,8 +355,7 @@ func (r *FormatRegistry) ProbeAll(ctx context.Context) (available, unavailable i
 
 		f, probeErr := r.Probe(ctx, id)
 		if probeErr != nil {
-			// Skip formats that fail to probe (e.g. prober error)
-			unavailable++
+			probeErrors = append(probeErrors, fmt.Errorf("%s: %w", id, probeErr))
 			continue
 		}
 
@@ -323,7 +375,7 @@ func (r *FormatRegistry) ProbeAll(ctx context.Context) (available, unavailable i
 			}
 		}
 	}
-	return available, unavailable, nil
+	return available, unavailable, errors.Join(probeErrors...)
 }
 
 // SetProber sets or replaces the format prober. This supports lazy injection
@@ -350,6 +402,7 @@ func (r *FormatRegistry) Clone() *FormatRegistry {
 
 	c := &FormatRegistry{
 		formats:       make(map[string]*OutputFormat, len(r.formats)),
+		declared:      make(map[string]struct{}, len(r.declared)),
 		parser:        r.parser,
 		probeTTL:      r.probeTTL,
 		probeInterval: r.probeInterval,
@@ -357,6 +410,40 @@ func (r *FormatRegistry) Clone() *FormatRegistry {
 	for id, f := range r.formats {
 		cp := *f
 		c.formats[id] = &cp
+	}
+	for id := range r.declared {
+		c.declared[id] = struct{}{}
+	}
+	return c
+}
+
+// CloneDeclaredClean creates a copy containing only explicitly declared
+// formats. Compile-time constants are preserved as-is, while runtime probe
+// state is reset so the caller adopts declarations/profiles without inheriting
+// transient availability results.
+func (r *FormatRegistry) CloneDeclaredClean() *FormatRegistry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	c := &FormatRegistry{
+		formats:       make(map[string]*OutputFormat, len(r.declared)),
+		declared:      make(map[string]struct{}, len(r.declared)),
+		parser:        r.parser,
+		probeTTL:      r.probeTTL,
+		probeInterval: r.probeInterval,
+	}
+	for id := range r.declared {
+		f := r.formats[id]
+		if f == nil {
+			continue
+		}
+		cp := *f
+		if !isConstantFormat(&cp) {
+			cp.Status = FormatUnverified
+			cp.VerifiedAt = time.Time{}
+		}
+		c.formats[id] = &cp
+		c.declared[id] = struct{}{}
 	}
 	return c
 }
@@ -382,4 +469,8 @@ func isConstantFormat(f *OutputFormat) bool {
 		return false
 	}
 	return f.Status == FormatAvailable && f.VerifiedAt.Equal(constantVerifiedAt)
+}
+
+func isVerifiedProbeStatus(status FormatStatus) bool {
+	return status == FormatAvailable || status == FormatUnavailable
 }

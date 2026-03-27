@@ -2,12 +2,11 @@ package edgetts
 
 import "github.com/simp-lee/ttsbridge/tts"
 
-// OutputOptions 返回 EdgeTTS 支持的输出格式选项列表（按比特率从低到高排列）。
+// OutputOptions 返回 EdgeTTS 推荐的输出格式目录（按比特率从低到高排列）。
 //
-// 格式来源: 通过实际调用 Edge TTS WebSocket API 探测验证（2026-02-21）。
-// Edge TTS 注册表中共 37 个格式，其中 9 个验证为可用（FormatAvailable），
-// 28 个验证为不可用（FormatUnavailable）。本方法仅返回推荐的 5 种常用格式。
-// 完整的 9 个可用格式可通过 provider.FormatRegistry().Available() 获取。
+// 这些条目是稳定的格式目录与音频 profile 映射，不代表当前环境已经验证可用。
+// 如需得到当前环境下已验证可用的格式，请先对 FormatRegistry 做显式 probe，
+// 再读取 provider.SupportedFormats()。
 //
 // 如需重新验证:
 //
@@ -20,7 +19,7 @@ import "github.com/simp-lee/ttsbridge/tts"
 //	    fmt.Printf("%-45s %s\n", opt.FormatID, opt.Label)
 //	}
 func (p *Provider) OutputOptions() []tts.OutputOption {
-	const verifiedNote = "实际探测验证 (2026-02-21, Edge TTS WebSocket API)"
+	const verifiedNote = "目录条目；当前环境可用性需显式 probe"
 
 	return []tts.OutputOption{
 		{
@@ -56,7 +55,7 @@ func (p *Provider) OutputOptions() []tts.OutputOption {
 			FormatID:    OutputFormatPCM_24khz,
 			Label:       "PCM 24kHz 无损",
 			Description: "无损音频，文件体积大，适合存档或后期加工",
-			Profile:     tts.VoiceAudioProfile{Format: tts.AudioFormatWAV, SampleRate: 24000, Channels: 1, Lossless: true},
+			Profile:     tts.VoiceAudioProfile{Format: tts.AudioFormatPCM, SampleRate: 24000, Channels: 1, Lossless: true},
 			Verified:    verifiedNote,
 		},
 	}

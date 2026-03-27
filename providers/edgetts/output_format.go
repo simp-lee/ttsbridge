@@ -26,29 +26,35 @@ const (
 // output formats.
 var defaultFormatRegistry *tts.FormatRegistry
 
+var edgeTTSKnownFormats = []struct {
+	id      string
+	profile tts.VoiceAudioProfile
+}{
+	{OutputFormatMP3_24khz_48k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 24000, Channels: 1, Bitrate: 48}},
+	{OutputFormatMP3_24khz_96k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 24000, Channels: 1, Bitrate: 96}},
+	{OutputFormatMP3_24khz_160k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 24000, Channels: 1, Bitrate: 160}},
+	{OutputFormatMP3_48khz_192k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 48000, Channels: 1, Bitrate: 192}},
+	{OutputFormatMP3_48khz_320k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 48000, Channels: 1, Bitrate: 320}},
+	{OutputFormatOpus_24khz, tts.VoiceAudioProfile{Format: "opus", SampleRate: tts.SampleRate48kHz, Channels: 1}},
+	{OutputFormatPCM_24khz, tts.VoiceAudioProfile{Format: tts.AudioFormatPCM, SampleRate: 24000, Channels: 1, Lossless: true}},
+	{OutputFormatWebM_24khz, tts.VoiceAudioProfile{Format: "webm", SampleRate: tts.SampleRate48kHz, Channels: 1}},
+	{OutputFormatOgg_24khz, tts.VoiceAudioProfile{Format: "ogg", SampleRate: tts.SampleRate48kHz, Channels: 1}},
+}
+
 func init() {
 	defaultFormatRegistry = tts.NewFormatRegistry(
 		tts.WithProfileParser(ParseOutputFormat),
 	)
 
-	// Register compile-time constants — these 9 formats are known-good and
-	// marked FormatAvailable at init time. Their profiles are hand-verified to
-	// match the output of ParseOutputFormat. No runtime probing required.
-	for _, c := range []struct {
-		id      string
-		profile tts.VoiceAudioProfile
-	}{
-		{OutputFormatMP3_24khz_48k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 24000, Channels: 1, Bitrate: 48}},
-		{OutputFormatMP3_24khz_96k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 24000, Channels: 1, Bitrate: 96}},
-		{OutputFormatMP3_24khz_160k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 24000, Channels: 1, Bitrate: 160}},
-		{OutputFormatMP3_48khz_192k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 48000, Channels: 1, Bitrate: 192}},
-		{OutputFormatMP3_48khz_320k, tts.VoiceAudioProfile{Format: tts.AudioFormatMP3, SampleRate: 48000, Channels: 1, Bitrate: 320}},
-		{OutputFormatOpus_24khz, tts.VoiceAudioProfile{Format: "opus", SampleRate: 24000, Channels: 1}},
-		{OutputFormatPCM_24khz, tts.VoiceAudioProfile{Format: tts.AudioFormatWAV, SampleRate: 24000, Channels: 1, Lossless: true}},
-		{OutputFormatWebM_24khz, tts.VoiceAudioProfile{Format: "webm", SampleRate: 24000, Channels: 1}},
-		{OutputFormatOgg_24khz, tts.VoiceAudioProfile{Format: "ogg", SampleRate: 24000, Channels: 1}},
-	} {
-		defaultFormatRegistry.RegisterConstant(c.id, c.profile)
+	// Register the documented catalog as FormatUnverified.
+	// Edge runtime availability must be established by an explicit probe in the
+	// current environment before these IDs are reported by SupportedFormats().
+	for _, c := range edgeTTSKnownFormats {
+		defaultFormatRegistry.Register(tts.OutputFormat{
+			ID:      c.id,
+			Profile: c.profile,
+			Status:  tts.FormatUnverified,
+		})
 	}
 
 	// Register additional Azure-documented formats as FormatUnverified.
@@ -117,6 +123,93 @@ var (
 	bitrateRe    = regexp.MustCompile(`(\d+)kbitrate`)
 )
 
+func parseSampleRate(format string) int {
+	m := sampleRateRe.FindStringSubmatch(format)
+	if len(m) <= 1 {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	if strings.Contains(m[0], "khz") {
+		return n * 1000
+	}
+	return n
+}
+
+func parseChannels(format string) int {
+	if strings.Contains(format, "stereo") {
+		return 2
+	}
+	return 1
+}
+
+func parseBitrate(format string) int {
+	m := bitrateRe.FindStringSubmatch(format)
+	if len(m) <= 1 {
+		return 0
+	}
+	bitrate, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return bitrate
+}
+
+func normalizeProfileSampleRate(profile *tts.VoiceAudioProfile, lowerFormat string) {
+	if strings.HasSuffix(lowerFormat, "-opus") {
+		// Opus streams are decoded on a fixed 48kHz clock even when the format ID
+		// advertises a lower nominal bandwidth such as 16kHz or 24kHz.
+		profile.SampleRate = tts.SampleRate48kHz
+	}
+}
+
+func resolveProfileFormat(profile *tts.VoiceAudioProfile, lowerFormat string) {
+	switch {
+	case strings.HasPrefix(lowerFormat, "riff-"):
+		resolveRiffFormat(profile, lowerFormat)
+	case strings.HasPrefix(lowerFormat, "ogg-"):
+		profile.Format = "ogg"
+	case strings.HasPrefix(lowerFormat, "webm-"):
+		profile.Format = "webm"
+	case strings.HasPrefix(lowerFormat, "amr-wb-"):
+		profile.Format = "amr-wb"
+	case strings.HasPrefix(lowerFormat, "g722-"):
+		profile.Format = "g722"
+	case strings.HasSuffix(lowerFormat, "-truesilk"):
+		profile.Format = "silk"
+	case strings.HasSuffix(lowerFormat, "-alaw"):
+		profile.Format = "alaw"
+	case strings.HasSuffix(lowerFormat, "-mulaw"):
+		profile.Format = "mulaw"
+	case strings.HasPrefix(lowerFormat, "raw-") && strings.HasSuffix(lowerFormat, "-pcm"):
+		profile.Format = tts.AudioFormatPCM
+		profile.Lossless = true
+	case strings.HasSuffix(lowerFormat, "-pcm"):
+		profile.Format = tts.AudioFormatWAV
+		profile.Lossless = true
+	case strings.HasSuffix(lowerFormat, "-mp3"):
+		profile.Format = tts.AudioFormatMP3
+	case strings.HasSuffix(lowerFormat, "-opus"):
+		profile.Format = "opus"
+	default:
+		profile.Format = tts.AudioFormatMP3
+	}
+}
+
+func resolveRiffFormat(profile *tts.VoiceAudioProfile, lowerFormat string) {
+	switch {
+	case strings.HasSuffix(lowerFormat, "-alaw"):
+		profile.Format = "alaw"
+	case strings.HasSuffix(lowerFormat, "-mulaw"):
+		profile.Format = "mulaw"
+	default:
+		profile.Format = tts.AudioFormatWAV
+		profile.Lossless = true
+	}
+}
+
 // ParseOutputFormat parses an Edge TTS output format string into a VoiceAudioProfile.
 // Format examples:
 //
@@ -132,76 +225,17 @@ var (
 //	"amr-wb-16000hz"
 //	"g722-16khz-64kbps"
 func ParseOutputFormat(format string) (tts.VoiceAudioProfile, bool) {
-	profile := tts.VoiceAudioProfile{}
-
-	// Parse sample rate: match "24khz", "48khz" (NNkhz) and "22050hz", "44100hz" (NNNNNhz)
-	if m := sampleRateRe.FindStringSubmatch(format); len(m) > 1 {
-		if n, err := strconv.Atoi(m[1]); err == nil {
-			if strings.Contains(m[0], "khz") {
-				profile.SampleRate = n * 1000
-			} else {
-				// Direct Hz value (e.g. "22050hz", "44100hz", "16000hz")
-				profile.SampleRate = n
-			}
-		}
+	profile := tts.VoiceAudioProfile{
+		SampleRate: parseSampleRate(format),
+		Channels:   parseChannels(format),
+		Bitrate:    parseBitrate(format),
 	}
 	if profile.SampleRate == 0 {
 		return profile, false
 	}
-
-	// Parse channels
-	if strings.Contains(format, "mono") {
-		profile.Channels = 1
-	} else if strings.Contains(format, "stereo") {
-		profile.Channels = 2
-	} else {
-		profile.Channels = 1 // default mono
-	}
-
-	// Parse bitrate: look for pattern like "48kbitrate" or "192kbitrate"
-	if m := bitrateRe.FindStringSubmatch(format); len(m) > 1 {
-		if br, err := strconv.Atoi(m[1]); err == nil {
-			profile.Bitrate = br
-		}
-	}
-
-	// Parse format (check container/codec prefixes first, then codec suffixes)
 	lowerFormat := strings.ToLower(format)
-	switch {
-	case strings.HasPrefix(lowerFormat, "riff-"):
-		switch {
-		case strings.HasSuffix(lowerFormat, "-alaw"):
-			profile.Format = "alaw"
-		case strings.HasSuffix(lowerFormat, "-mulaw"):
-			profile.Format = "mulaw"
-		default:
-			profile.Format = tts.AudioFormatWAV
-			profile.Lossless = true
-		}
-	case strings.HasPrefix(lowerFormat, "ogg-"):
-		profile.Format = "ogg"
-	case strings.HasPrefix(lowerFormat, "webm-"):
-		profile.Format = "webm"
-	case strings.HasPrefix(lowerFormat, "amr-wb-"):
-		profile.Format = "amr-wb"
-	case strings.HasPrefix(lowerFormat, "g722-"):
-		profile.Format = "g722"
-	case strings.HasSuffix(lowerFormat, "-truesilk"):
-		profile.Format = "silk"
-	case strings.HasSuffix(lowerFormat, "-alaw"):
-		profile.Format = "alaw"
-	case strings.HasSuffix(lowerFormat, "-mulaw"):
-		profile.Format = "mulaw"
-	case strings.HasPrefix(lowerFormat, "raw-") || strings.HasSuffix(lowerFormat, "-pcm"):
-		profile.Format = tts.AudioFormatWAV
-		profile.Lossless = true
-	case strings.HasSuffix(lowerFormat, "-mp3"):
-		profile.Format = tts.AudioFormatMP3
-	case strings.HasSuffix(lowerFormat, "-opus"):
-		profile.Format = "opus"
-	default:
-		profile.Format = tts.AudioFormatMP3
-	}
+	resolveProfileFormat(&profile, lowerFormat)
+	normalizeProfileSampleRate(&profile, lowerFormat)
 
 	return profile, true
 }

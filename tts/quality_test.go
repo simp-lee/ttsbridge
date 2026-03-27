@@ -2,6 +2,8 @@ package tts
 
 import "testing"
 
+// 这些测试覆盖 OutputOption 输出选项元数据，而不是独立的 quality 语义层。
+
 func TestOutputOption_Fields(t *testing.T) {
 	opt := OutputOption{
 		FormatID:    "audio-48khz-192kbitrate-mono-mp3",

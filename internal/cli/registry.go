@@ -3,6 +3,9 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/url"
 	"sort"
 	"time"
 
@@ -48,23 +51,45 @@ type ProviderConfig struct {
 }
 
 // ProviderFactory creates a ProviderAdapter with the given configuration
-type ProviderFactory func(cfg *ProviderConfig) ProviderAdapter
+type ProviderFactory func(cfg *ProviderConfig) (ProviderAdapter, error)
 
 // registry stores registered provider factories
 var registry = make(map[string]ProviderFactory)
 
 // RegisterProvider registers a provider factory with the given name
 func RegisterProvider(name string, factory ProviderFactory) {
+	if _, exists := registry[name]; exists {
+		panic(fmt.Sprintf("provider %q already registered", name))
+	}
 	registry[name] = factory
 }
 
 // GetProvider returns a provider adapter for the given name, or nil if not found
-func GetProvider(name string, cfg *ProviderConfig) ProviderAdapter {
+func GetProvider(name string, cfg *ProviderConfig) (ProviderAdapter, error) {
 	factory, ok := registry[name]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	return factory(cfg)
+}
+
+func validateProxyURL(rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return newProviderConfigValidationError(fmt.Sprintf("invalid proxy URL %q", rawURL), err)
+	}
+	if parsedURL == nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return newProviderConfigValidationError(
+			fmt.Sprintf("invalid proxy URL %q", rawURL),
+			errors.New("proxy URL must include scheme and host"),
+		)
+	}
+
+	return nil
 }
 
 // ListProviders returns the names of all registered providers (sorted)

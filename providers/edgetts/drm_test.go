@@ -394,7 +394,7 @@ func TestTokenGenerationAlgorithm(t *testing.T) {
 		t.Errorf("Token length should be 64, got %d", len(token))
 	}
 	for _, c := range token {
-		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) {
+		if c < '0' || (c > '9' && c < 'A') || c > 'F' {
 			t.Errorf("Token should be uppercase hex, got: %s", token)
 			break
 		}

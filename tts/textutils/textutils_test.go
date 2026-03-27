@@ -66,6 +66,10 @@ func TestSplitByByteLength(t *testing.T) {
 					t.Errorf("chunk %d contains invalid UTF-8", i)
 				}
 			}
+
+			if joined := strings.Join(chunks, ""); joined != strings.TrimSpace(tt.text) {
+				t.Errorf("joined chunks = %q, want %q", joined, strings.TrimSpace(tt.text))
+			}
 		})
 	}
 }
@@ -89,6 +93,64 @@ func TestSplitByByteLengthPreserveEntities(t *testing.T) {
 			if strings.Count(chunk, "&") != strings.Count(chunk, "&amp;") {
 				t.Fatalf("chunk %d splits HTML entity: %q", i, chunk)
 			}
+		}
+	}
+}
+
+func TestSplitByByteLength_TinyMaxBytesKeepsUTF8Intact(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		max  int
+		want string
+	}{
+		{name: "single chinese rune", text: "你好吗", max: 1, want: "你"},
+		{name: "single emoji", text: "🙂abc", max: 2, want: "🙂"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunks := SplitByByteLength(tt.text, &SplitOptions{MaxBytes: tt.max})
+			if len(chunks) == 0 {
+				t.Fatal("expected non-empty chunks")
+			}
+			if chunks[0] != tt.want {
+				t.Fatalf("first chunk = %q, want %q", chunks[0], tt.want)
+			}
+			if len(chunks[0]) <= tt.max {
+				t.Fatalf("first chunk should exceed max bytes when no smaller safe split exists: len=%d max=%d", len(chunks[0]), tt.max)
+			}
+			for i, chunk := range chunks {
+				if !utf8.ValidString(chunk) {
+					t.Fatalf("chunk %d contains invalid UTF-8: %q", i, chunk)
+				}
+			}
+		})
+	}
+}
+
+func TestSplitByByteLength_TinyMaxBytesKeepsHTMLEntitiesIntact(t *testing.T) {
+	text := "&amp;hello"
+	chunks := SplitByByteLength(text, &SplitOptions{
+		MaxBytes:             1,
+		PreserveHTMLEntities: true,
+	})
+
+	if len(chunks) == 0 {
+		t.Fatal("expected non-empty chunks")
+	}
+	if chunks[0] != "&amp;" {
+		t.Fatalf("first chunk = %q, want %q", chunks[0], "&amp;")
+	}
+	if len(chunks[0]) <= 1 {
+		t.Fatalf("first chunk should exceed max bytes when preserving an entity, len=%d", len(chunks[0]))
+	}
+	for i, chunk := range chunks {
+		if !utf8.ValidString(chunk) {
+			t.Fatalf("chunk %d contains invalid UTF-8: %q", i, chunk)
+		}
+		if strings.Contains(chunk, "&") && !strings.Contains(chunk, ";") {
+			t.Fatalf("chunk %d contains a broken HTML entity: %q", i, chunk)
 		}
 	}
 }
@@ -184,6 +246,9 @@ func TestSplitByByteLengthNewlineAndSpace(t *testing.T) {
 	// 第一个块应该在换行符处切割
 	if len(chunks) > 0 && !strings.Contains(chunks[0], "Hello") {
 		t.Errorf("expected first chunk to contain 'Hello', got %q", chunks[0])
+	}
+	if strings.Join(chunks, "") != strings.TrimSpace(text) {
+		t.Errorf("joined chunks = %q, want %q", strings.Join(chunks, ""), strings.TrimSpace(text))
 	}
 }
 
@@ -317,15 +382,28 @@ func TestEdgeCases(t *testing.T) {
 				}
 			}
 
-			// 合并后应该能还原原文本（忽略空白）
+			// 合并后应该精确还原原文本（仅忽略最外层空白）
 			if len(chunks) > 0 {
 				joined := strings.Join(chunks, "")
 				original := strings.TrimSpace(tt.text)
-				if strings.ReplaceAll(joined, " ", "") != strings.ReplaceAll(original, " ", "") {
-					t.Errorf("joined chunks don't match original (ignoring spaces): got %q, want %q", joined, original)
+				if joined != original {
+					t.Errorf("joined chunks don't match original: got %q, want %q", joined, original)
 				}
 			}
 		})
+	}
+}
+
+func TestSplitByByteLength_PreservesBoundaryWhitespace(t *testing.T) {
+	text := "Alpha beta\nGamma delta"
+	chunks := SplitByByteLength(text, &SplitOptions{MaxBytes: 12})
+
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+
+	if joined := strings.Join(chunks, ""); joined != strings.TrimSpace(text) {
+		t.Fatalf("joined chunks = %q, want %q", joined, strings.TrimSpace(text))
 	}
 }
 

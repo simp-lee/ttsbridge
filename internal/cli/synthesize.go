@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var now = time.Now
+
 // SynthesizeCmd represents the synthesize subcommand
 type SynthesizeCmd struct {
 	fs            *flag.FlagSet
@@ -73,7 +75,7 @@ Flags:
   --proxy string          Proxy URL (optional)
   --http-timeout duration HTTP timeout, e.g. 30s (default 30s)
   --max-attempts int      Max attempts including first (default 3)
-  -h, --help              Help for synthesize`)
+	-h, --help              Help for synthesize`)
 }
 
 // Name returns the command name
@@ -94,6 +96,12 @@ func (c *SynthesizeCmd) Run(args []string, stdoutWriter, stderr io.Writer) error
 	if c.maxInputBytes < 0 {
 		return &UsageError{Message: "--max-input-bytes must be >= 0"}
 	}
+	if c.maxAttempts < 1 {
+		return &UsageError{Message: "--max-attempts must be >= 1"}
+	}
+	if c.httpTimeout <= 0 {
+		return &UsageError{Message: "--http-timeout must be > 0"}
+	}
 
 	cfg := &ProviderConfig{
 		Proxy:       c.proxy,
@@ -101,7 +109,10 @@ func (c *SynthesizeCmd) Run(args []string, stdoutWriter, stderr io.Writer) error
 		MaxAttempts: c.maxAttempts,
 	}
 
-	adapter := GetProvider(c.provider, cfg)
+	adapter, err := GetProvider(c.provider, cfg)
+	if err != nil {
+		return usageErrorForProviderConfig(err)
+	}
 	if adapter == nil {
 		return &UsageError{Message: fmt.Sprintf("unknown provider: %q (available: %s)", c.provider, strings.Join(ListProviders(), ", "))}
 	}
@@ -141,25 +152,24 @@ func (c *SynthesizeCmd) Run(args []string, stdoutWriter, stderr io.Writer) error
 	// Parse rate/volume/pitch
 	rate, err := ParseRatePercent(c.rate)
 	if err != nil {
-		return &UsageError{Message: fmt.Sprintf("invalid --rate: %v", err)}
+		return &UsageError{Message: "invalid --rate", Err: err}
 	}
 	volume, err := ParseVolumePercent(c.volume)
 	if err != nil {
-		return &UsageError{Message: fmt.Sprintf("invalid --volume: %v", err)}
+		return &UsageError{Message: "invalid --volume", Err: err}
 	}
 	pitch, err := ParsePitchPercent(c.pitch)
 	if err != nil {
-		return &UsageError{Message: fmt.Sprintf("invalid --pitch: %v", err)}
+		return &UsageError{Message: "invalid --pitch", Err: err}
 	}
 
-	// Read input text
 	inputText, err := c.readInputText()
 	if err != nil {
 		var usageErr *UsageError
 		if errors.As(err, &usageErr) {
 			return usageErr
 		}
-		return &RuntimeError{Message: fmt.Sprintf("failed to read input text: %v", err)}
+		return &RuntimeError{Message: "failed to read input text", Err: err}
 	}
 	if strings.TrimSpace(inputText) == "" {
 		return &UsageError{Message: "input text cannot be empty"}
@@ -180,35 +190,45 @@ func (c *SynthesizeCmd) Run(args []string, stdoutWriter, stderr io.Writer) error
 		Pitch:  pitch,
 	}
 
-	// Synthesize
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeoutBudget(c.httpTimeout, c.maxAttempts))
+	defer cancel()
 	audioData, err := adapter.Synthesize(ctx, req)
 	if err != nil {
-		return &RuntimeError{Message: fmt.Sprintf("synthesis failed: %v", err)}
+		return &RuntimeError{Message: "synthesis failed", Err: err}
 	}
 
 	// Write output
 	if c.stdout {
 		_, err = stdoutWriter.Write(audioData)
-		return err
+		if err != nil {
+			return &RuntimeError{Message: "failed to write output", Err: err}
+		}
+		return nil
 	}
 
 	outputPath := c.out
 	if outputPath == "" {
-		outputPath = c.generateOutputPath(adapter.DefaultFormat())
-		fmt.Fprintf(stderr, "Output: %s\n", outputPath)
+		outputFile, generatedPath, err := c.createAutoOutputFile(adapter.DefaultFormat())
+		if err != nil {
+			return &RuntimeError{Message: "failed to create output file", Err: err}
+		}
+		if err := writeOutputFile(outputFile, generatedPath, audioData); err != nil {
+			return &RuntimeError{Message: "failed to write output file", Err: err}
+		}
+		fmt.Fprintf(stderr, "Output: %s\n", generatedPath)
+		return nil
 	}
 
 	// Ensure directory exists
 	dir := filepath.Dir(outputPath)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			return &RuntimeError{Message: fmt.Sprintf("failed to create output directory: %v", err)}
+			return &RuntimeError{Message: "failed to create output directory", Err: err}
 		}
 	}
 
 	if err := os.WriteFile(outputPath, audioData, 0644); err != nil {
-		return &RuntimeError{Message: fmt.Sprintf("failed to write output file: %v", err)}
+		return &RuntimeError{Message: "failed to write output file", Err: err}
 	}
 
 	return nil
@@ -228,7 +248,7 @@ func (c *SynthesizeCmd) readInputText() (string, error) {
 			if os.IsNotExist(err) {
 				return "", &UsageError{Message: fmt.Sprintf("input file not found: %q", c.file)}
 			}
-			return "", &RuntimeError{Message: fmt.Sprintf("failed to open input file %q: %v", c.file, err)}
+			return "", &RuntimeError{Message: fmt.Sprintf("failed to open input file %q", c.file), Err: err}
 		}
 		defer f.Close()
 		reader = f
@@ -254,7 +274,38 @@ func (c *SynthesizeCmd) readInputText() (string, error) {
 	return string(data), nil
 }
 
-func (c *SynthesizeCmd) generateOutputPath(format string) string {
-	timestamp := time.Now().Format("20060102_150405")
-	return fmt.Sprintf("tts_%s_%s.%s", c.provider, timestamp, format)
+func (c *SynthesizeCmd) generateOutputPath(format string, suffix int) string {
+	timestamp := now().Format("20060102_150405.000000000")
+	base := fmt.Sprintf("tts_%s_%s", c.provider, timestamp)
+	if suffix == 0 {
+		return fmt.Sprintf("%s.%s", base, format)
+	}
+	return fmt.Sprintf("%s_%d.%s", base, suffix, format)
+}
+
+func (c *SynthesizeCmd) createAutoOutputFile(format string) (*os.File, string, error) {
+	for suffix := 0; ; suffix++ {
+		path := c.generateOutputPath(format, suffix)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err == nil {
+			return file, path, nil
+		}
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return nil, "", err
+	}
+}
+
+func writeOutputFile(file *os.File, path string, data []byte) error {
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }

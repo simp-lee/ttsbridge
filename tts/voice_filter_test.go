@@ -19,6 +19,8 @@ func TestFilterVoices(t *testing.T) {
 	}{
 		{"no filter", VoiceFilter{}, 6},
 		{"language zh-CN", VoiceFilter{Language: "zh-CN"}, 3},
+		{"language uppercase zh-CN", VoiceFilter{Language: "ZH-CN"}, 3},
+		{"language padded prefix zh", VoiceFilter{Language: "  zh  "}, 3},
 		{"language prefix zh", VoiceFilter{Language: "zh"}, 3},
 		{"language en", VoiceFilter{Language: "en"}, 2},
 		{"gender female", VoiceFilter{Gender: GenderFemale}, 4},
@@ -228,5 +230,62 @@ func TestFilterVoices_EmptyInput(t *testing.T) {
 	result = FilterVoices([]Voice{}, VoiceFilter{Language: "en"})
 	if len(result) != 0 {
 		t.Errorf("expected empty result for empty input, got %d", len(result))
+	}
+}
+
+func TestFilterVoices_RejectsInvalidLanguagePrefixes(t *testing.T) {
+	voices := []Voice{
+		{ID: "en-US-JennyNeural", Language: "en-US", Gender: GenderFemale, Provider: "edgetts"},
+		{ID: "zh-CN-XiaoxiaoNeural", Language: "zh-CN", Gender: GenderFemale, Provider: "edgetts"},
+	}
+
+	for _, lang := range []string{"e", "z", "en-", "zh-"} {
+		result := FilterVoices(voices, VoiceFilter{Language: lang})
+		if len(result) != 0 {
+			t.Fatalf("FilterVoices(%q) returned %d voices, want 0", lang, len(result))
+		}
+	}
+}
+
+func TestFilterVoices_ReturnsDeepCopies(t *testing.T) {
+	voices := []Voice{
+		{
+			ID:        "zh-CN-XiaoxiaoNeural",
+			Language:  "zh-CN",
+			Languages: []Language{"zh-CN", "en-US"},
+			Gender:    GenderFemale,
+			Provider:  "edgetts",
+			Extra: &testExtra{
+				Status: "GA",
+				Styles: []string{"cheerful"},
+			},
+		},
+	}
+
+	filtered := FilterVoices(voices, VoiceFilter{Language: "zh"})
+	if len(filtered) != 1 {
+		t.Fatalf("FilterVoices() returned %d voices, want 1", len(filtered))
+	}
+
+	filtered[0].Languages[0] = "fr-FR"
+	extra, ok := GetExtra[*testExtra](&filtered[0])
+	if !ok {
+		t.Fatal("GetExtra() failed for filtered result")
+	}
+	extra.Status = "Preview"
+	extra.Styles[0] = "sad"
+
+	if voices[0].Languages[0] != "zh-CN" {
+		t.Fatalf("source Languages mutated: got %q, want %q", voices[0].Languages[0], "zh-CN")
+	}
+	originalExtra, ok := GetExtra[*testExtra](&voices[0])
+	if !ok {
+		t.Fatal("GetExtra() failed for source voice")
+	}
+	if originalExtra.Status != "GA" {
+		t.Fatalf("source Extra.Status mutated: got %q, want %q", originalExtra.Status, "GA")
+	}
+	if originalExtra.Styles[0] != "cheerful" {
+		t.Fatalf("source Extra.Styles mutated: got %q, want %q", originalExtra.Styles[0], "cheerful")
 	}
 }

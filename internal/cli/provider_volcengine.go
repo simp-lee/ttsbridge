@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/simp-lee/ttsbridge/providers/volcengine"
 	"github.com/simp-lee/ttsbridge/tts"
@@ -21,11 +22,14 @@ type volcengineAdapter struct {
 	provider *volcengine.Provider
 }
 
-func newVolcengineAdapter(cfg *ProviderConfig) ProviderAdapter {
+func newVolcengineAdapter(cfg *ProviderConfig) (ProviderAdapter, error) {
 	p := volcengine.New()
 
 	if cfg != nil {
 		if cfg.Proxy != "" {
+			if err := validateProxyURL(cfg.Proxy); err != nil {
+				return nil, fmt.Errorf("volcengine proxy: %w", err)
+			}
 			p.WithProxy(cfg.Proxy)
 		}
 		if cfg.HTTPTimeout > 0 {
@@ -36,7 +40,7 @@ func newVolcengineAdapter(cfg *ProviderConfig) ProviderAdapter {
 		}
 	}
 
-	return &volcengineAdapter{provider: p}
+	return &volcengineAdapter{provider: p}, nil
 }
 
 func (a *volcengineAdapter) Name() string {

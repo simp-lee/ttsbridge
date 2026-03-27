@@ -91,8 +91,8 @@ func TestOutputOptions_FormatIDsAreVerified(t *testing.T) {
 			t.Errorf("FormatID %q not found in FormatRegistry", opt.FormatID)
 			continue
 		}
-		if f.Status != tts.FormatAvailable {
-			t.Errorf("FormatID %q status is %v; want FormatAvailable", opt.FormatID, f.Status)
+		if f.Status != tts.FormatUnverified {
+			t.Errorf("FormatID %q status is %v; want FormatUnverified before probe", opt.FormatID, f.Status)
 		}
 	}
 }
@@ -161,11 +161,9 @@ func TestOutputOptions_VerifiedFieldPopulated(t *testing.T) {
 	}
 }
 
-// TestOutputOptions_SubsetOfRegistryAvailable 验证 OutputOptions 中的每个格式 ID
-// 都存在于 FormatRegistry 并且状态为 FormatAvailable。
-// 如果 Provider 的可用格式发生变化（例如上游 API 移除了某格式），
-// FormatRegistry 的常量或探测结果会先变更，此测试会自动捕获不一致。
-func TestOutputOptions_SubsetOfRegistryAvailable(t *testing.T) {
+// TestOutputOptions_SubsetOfRegistryCatalog 验证 OutputOptions 中的每个格式 ID
+// 都存在于 FormatRegistry，并且在显式 probe 前保持未验证状态。
+func TestOutputOptions_SubsetOfRegistryCatalog(t *testing.T) {
 	provider := New()
 	options := provider.OutputOptions()
 	registry := provider.FormatRegistry()
@@ -176,9 +174,26 @@ func TestOutputOptions_SubsetOfRegistryAvailable(t *testing.T) {
 			t.Errorf("OutputOptions format %q not found in FormatRegistry — registry may have changed", opt.FormatID)
 			continue
 		}
-		if f.Status != tts.FormatAvailable {
-			t.Errorf("OutputOptions format %q has registry status %v; want FormatAvailable — format may no longer be supported",
+		if f.Status != tts.FormatUnverified {
+			t.Errorf("OutputOptions format %q has registry status %v; want FormatUnverified before probe",
 				opt.FormatID, f.Status)
 		}
 	}
+}
+
+func TestOutputOptions_RawPCMUsesPCMMetadata(t *testing.T) {
+	provider := New()
+	options := provider.OutputOptions()
+
+	for _, opt := range options {
+		if opt.FormatID != OutputFormatPCM_24khz {
+			continue
+		}
+		if opt.Profile.Format != tts.AudioFormatPCM {
+			t.Fatalf("Profile.Format = %q, want %q", opt.Profile.Format, tts.AudioFormatPCM)
+		}
+		return
+	}
+
+	t.Fatal("raw PCM output option not found")
 }

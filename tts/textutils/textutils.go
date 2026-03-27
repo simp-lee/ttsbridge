@@ -40,7 +40,8 @@ var defaultControlCharRanges = [][2]int{
 // 2. 优先在自然边界切割（换行符 > 空格 > 标点符号）
 // 3. 不破坏 UTF-8 多字节字符
 // 4. 不破坏 HTML/XML 实体（如 &amp;）当 PreserveHTMLEntities 为 true 时
-// 5. 自动去除每个块首尾的空白字符
+// 5. 保留块内边界分隔符，仅在整体输入层面去除首尾空白
+// 6. 当 MaxBytes 小于单个完整字符或实体时，返回最小的安全块，即使该块会超过 MaxBytes
 //
 // 参数：
 //   - text: 待切割的文本
@@ -74,20 +75,19 @@ func SplitByByteLength(text string, opts *SplitOptions) []string {
 	for len(data) > opts.MaxBytes {
 		splitAt := locateSplitPoint(data, opts.MaxBytes, separatorBytes, opts.PreserveHTMLEntities)
 
-		// 防止无限循环：如果切割点无效，至少前进一个字节
-		// 参考 edge-tts: text = text[split_at if split_at > 0 else 1:]
+		// 防止无限循环：找不到安全切点时，只能消费剩余数据。
 		if splitAt <= 0 {
-			splitAt = 1
+			splitAt = len(data)
 		}
 
-		if chunk := bytes.TrimSpace(data[:splitAt]); len(chunk) > 0 {
+		if chunk := data[:splitAt]; len(chunk) > 0 {
 			chunks = append(chunks, string(chunk))
 		}
 
 		data = data[splitAt:]
 	}
 
-	if remaining := bytes.TrimSpace(data); len(remaining) > 0 {
+	if remaining := data; len(remaining) > 0 {
 		chunks = append(chunks, string(remaining))
 	}
 
@@ -203,18 +203,24 @@ func locateSplitPoint(data []byte, maxBytes int, separators [][]byte, preserveHT
 
 	// 1. 尝试在分隔符处切割（按优先级查找）
 	splitAt := lastSeparatorIndex(data, limit, separators)
-
-	// 2. 如果找不到分隔符，寻找安全的 UTF-8 边界
-	if splitAt < 0 {
-		splitAt = findSafeUTF8SplitPoint(data[:limit])
-	}
-
-	// 3. 调整切割点以避免破坏 HTML 实体
 	if preserveHTML && splitAt > 0 {
 		splitAt = adjustForHTMLEntity(data, splitAt)
 	}
+	if splitAt > 0 {
+		return splitAt
+	}
 
-	return splitAt
+	// 2. 如果找不到分隔符，寻找安全的 UTF-8 边界
+	splitAt = findSafeUTF8SplitPoint(data[:limit])
+	if preserveHTML && splitAt > 0 {
+		splitAt = adjustForHTMLEntity(data, splitAt)
+	}
+	if splitAt > 0 {
+		return splitAt
+	}
+
+	// 3. 无法在 maxBytes 内找到安全切点时，扩展到最小安全边界。
+	return findFirstSafeProgressPoint(data, preserveHTML)
 }
 
 func lastSeparatorIndex(data []byte, limit int, separators [][]byte) int {
@@ -277,4 +283,26 @@ func adjustForHTMLEntity(text []byte, splitAt int) int {
 	}
 
 	return splitAt
+}
+
+func findFirstSafeProgressPoint(data []byte, preserveHTML bool) int {
+	for splitAt := 1; splitAt <= len(data); {
+		_, size := utf8.DecodeRune(data[splitAt-1:])
+		if size <= 0 {
+			return len(data)
+		}
+		next := splitAt - 1 + size
+		if next > len(data) {
+			next = len(data)
+		}
+		if preserveHTML {
+			adjusted := adjustForHTMLEntity(data, next)
+			if adjusted != next {
+				splitAt = next + 1
+				continue
+			}
+		}
+		return next
+	}
+	return len(data)
 }

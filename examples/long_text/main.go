@@ -47,8 +47,8 @@ func main() {
 			}
 			// 只打印前几个示例
 			if wordCount+sentenceCount <= 5 {
-				fmt.Printf("  [%s] Offset: %dms, Duration: %dms, Text: %s\n",
-					event.Type, event.OffsetMs, event.DurationMs, event.Text)
+				fmt.Printf("  [chunk=%d %s] Offset: %dms, Duration: %dms, Text: %s\n",
+					event.ChunkIndex, event.Type, event.OffsetMs, event.DurationMs, event.Text)
 			}
 		},
 	}

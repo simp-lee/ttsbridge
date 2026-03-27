@@ -2,6 +2,8 @@ package tts
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,7 @@ const (
 type VoiceCache struct {
 	mu        sync.RWMutex
 	voices    []Voice
+	hasData   bool
 	fetchedAt time.Time
 	ttl       time.Duration
 	fetcher   func(ctx context.Context) ([]Voice, error)
@@ -34,6 +37,7 @@ type VoiceCache struct {
 	cancel       context.CancelFunc
 	done         chan struct{}
 	stopOnce     sync.Once
+	stopErr      error
 	stopWait     time.Duration
 	fetchTimeout time.Duration
 }
@@ -112,20 +116,23 @@ func (c *VoiceCache) Get(ctx context.Context, locale string) ([]Voice, error) {
 	voices, err := c.fetcher(ctx)
 	if err != nil {
 		// Stale-while-revalidate: return stale data if available
-		if len(c.voices) > 0 {
+		if c.hasData {
 			return c.filterByLocale(locale), nil
 		}
 		return nil, err
 	}
 
-	c.voices = voices
+	c.voices = cloneVoices(voices)
+	c.hasData = true
 	c.fetchedAt = time.Now()
 	return c.filterByLocale(locale), nil
 }
 
 // Stop terminates the background refresh goroutine, if any.
 // It is safe to call multiple times.
-func (c *VoiceCache) Stop() {
+// If the background goroutine does not stop within the configured wait window,
+// Stop returns an explicit error instead of silently reporting success.
+func (c *VoiceCache) Stop() error {
 	c.stopOnce.Do(func() {
 		if c.cancel != nil {
 			c.cancel()
@@ -133,16 +140,18 @@ func (c *VoiceCache) Stop() {
 				select {
 				case <-c.done:
 				case <-time.After(c.stopWait):
+					c.stopErr = errors.New("tts: voice cache background refresh did not stop before timeout")
 				}
 			}
 		}
 	})
+	return c.stopErr
 }
 
 // isValid reports whether the cache is populated and not expired.
 // Caller must hold at least RLock.
 func (c *VoiceCache) isValid() bool {
-	if len(c.voices) == 0 {
+	if !c.hasData {
 		return false
 	}
 	return time.Since(c.fetchedAt) < c.ttl
@@ -150,28 +159,19 @@ func (c *VoiceCache) isValid() bool {
 
 // filterByLocale returns voices matching the locale.
 // Empty locale returns all voices.
-// Matches against Voice.Language and Voice.Languages using case-insensitive comparison.
+// Matches against Voice.Language and Voice.Languages using case-insensitive prefix matching.
 // Caller must hold at least RLock.
 func (c *VoiceCache) filterByLocale(locale string) []Voice {
 	if locale == "" {
-		// Return a copy to avoid data races on the slice
-		result := make([]Voice, len(c.voices))
-		copy(result, c.voices)
-		return result
+		return cloneVoices(c.voices)
 	}
 
+	trimmedLocale := strings.ToLower(strings.TrimSpace(locale))
 	var result []Voice
 	for i := range c.voices {
 		v := &c.voices[i]
-		if strings.EqualFold(string(v.Language), locale) {
-			result = append(result, *v)
-			continue
-		}
-		for _, lang := range v.Languages {
-			if strings.EqualFold(string(lang), locale) {
-				result = append(result, *v)
-				break
-			}
+		if voiceMatchesLocale(v, trimmedLocale) {
+			result = append(result, cloneVoice(*v))
 		}
 	}
 	return result
@@ -185,7 +185,7 @@ func (c *VoiceCache) FindCached(voiceID string) (Voice, bool) {
 	defer c.mu.RUnlock()
 	for i := range c.voices {
 		if c.voices[i].ID == voiceID {
-			return c.voices[i], true
+			return cloneVoice(c.voices[i]), true
 		}
 	}
 	return Voice{}, false
@@ -211,9 +211,99 @@ func (c *VoiceCache) startBackgroundRefresh(ctx context.Context, interval time.D
 				continue
 			}
 			c.mu.Lock()
-			c.voices = voices
+			c.voices = cloneVoices(voices)
+			c.hasData = true
 			c.fetchedAt = time.Now()
 			c.mu.Unlock()
 		}
+	}
+}
+
+func voiceMatchesLocale(v *Voice, locale string) bool {
+	if locale == "" {
+		return true
+	}
+	return v.SupportsLanguage(locale)
+}
+
+func cloneVoices(voices []Voice) []Voice {
+	if len(voices) == 0 {
+		return nil
+	}
+	result := make([]Voice, len(voices))
+	for i := range voices {
+		result[i] = cloneVoice(voices[i])
+	}
+	return result
+}
+
+func cloneVoice(voice Voice) Voice {
+	clone := voice
+	if len(voice.Languages) > 0 {
+		clone.Languages = append([]Language(nil), voice.Languages...)
+	}
+	if voice.Extra != nil {
+		clone.Extra = deepCopyValue(reflect.ValueOf(voice.Extra)).Interface()
+	}
+	return clone
+}
+
+func deepCopyValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		copyPtr := reflect.New(value.Type().Elem())
+		copyPtr.Elem().Set(deepCopyValue(value.Elem()))
+		return copyPtr
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		copyElem := deepCopyValue(value.Elem())
+		copyIface := reflect.New(value.Type()).Elem()
+		copyIface.Set(copyElem)
+		return copyIface
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		copySlice := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			copySlice.Index(i).Set(deepCopyValue(value.Index(i)))
+		}
+		return copySlice
+	case reflect.Array:
+		copyArray := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			copyArray.Index(i).Set(deepCopyValue(value.Index(i)))
+		}
+		return copyArray
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		copyMap := reflect.MakeMapWithSize(value.Type(), value.Len())
+		for _, key := range value.MapKeys() {
+			copyMap.SetMapIndex(deepCopyValue(key), deepCopyValue(value.MapIndex(key)))
+		}
+		return copyMap
+	case reflect.Struct:
+		copyStruct := reflect.New(value.Type()).Elem()
+		copyStruct.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if !copyStruct.Field(i).CanSet() {
+				continue
+			}
+			copyStruct.Field(i).Set(deepCopyValue(value.Field(i)))
+		}
+		return copyStruct
+	default:
+		return value
 	}
 }

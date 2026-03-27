@@ -22,6 +22,15 @@ func buildSSML(opts *SynthesizeOptions) string {
 	)
 }
 
+func ssmlWrapperBytes(opts *SynthesizeOptions) int {
+	if opts == nil {
+		opts = &SynthesizeOptions{}
+	}
+	optsCopy := *opts
+	optsCopy.Text = ""
+	return len([]byte(buildSSML(&optsCopy)))
+}
+
 // formatProsody formats rate/volume: 1.0 = +0%, 1.5 = +50%, 0.5 = -50%
 func formatProsody(value float64) string {
 	if value == 0 || value == 1.0 {

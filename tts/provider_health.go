@@ -2,6 +2,7 @@ package tts
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -15,17 +16,34 @@ const (
 	defaultStopWaitTime  = 150 * time.Millisecond
 )
 
+// ErrProviderHealthStopTimeout indicates that Stop canceled the monitoring loop
+// but an in-flight checker did not exit within the configured wait window.
+var ErrProviderHealthStopTimeout = errors.New("tts: provider health check did not stop before timeout")
+
+// ErrNilProviderHealthChecker indicates that ProviderHealth was constructed
+// without a checker callback.
+var ErrNilProviderHealthChecker = errors.New("tts: ProviderHealth checker must not be nil")
+
 // ProviderHealth monitors provider availability via periodic health checks.
 // It supports consecutive failure counting with cooldown and automatic recovery.
 //
 // Usage:
 //
-//	health := tts.NewProviderHealth(func(ctx context.Context) bool {
+//	health, err := tts.NewProviderHealth(func(ctx context.Context) bool {
 //	    // perform a lightweight check against the provider
 //	    return provider.Ping(ctx) == nil
 //	}, tts.WithCheckInterval(2*time.Minute), tts.WithMaxFails(5))
-//	health.Start(ctx)
-//	defer health.Stop()
+//	if err != nil {
+//	    return err
+//	}
+//	if err := health.Start(ctx); err != nil {
+//	    return err
+//	}
+//	defer func() {
+//	    if err := health.Stop(); err != nil {
+//	        log.Printf("provider health stop: %v", err)
+//	    }
+//	}()
 //
 //	if health.IsHealthy() { ... }
 type ProviderHealth struct {
@@ -42,12 +60,14 @@ type ProviderHealth struct {
 	checkTimeout  time.Duration
 	stopWaitTime  time.Duration
 
-	checker  func(ctx context.Context) bool
-	cancel   context.CancelFunc
-	done     chan struct{}
-	stopOnce sync.Once
+	checker func(ctx context.Context) bool
+	cancel  context.CancelFunc
+	done    chan struct{}
 
-	checkInFlight bool
+	checkInFlight   bool
+	checkerStuck    bool
+	activeCheckDone <-chan struct{}
+	timedOutCheck   <-chan struct{}
 }
 
 // ProviderHealthOption configures a ProviderHealth.
@@ -92,12 +112,17 @@ func WithCheckTimeout(d time.Duration) ProviderHealthOption {
 }
 
 // NewProviderHealth creates a ProviderHealth with the given checker function and options.
-// The checker function should return true if the provider is healthy.
+// The checker function should return true if the provider is healthy. The
+// checker is expected to respect ctx cancellation promptly. A checker that
+// times out is first treated as an ordinary failed check; it is only marked as
+// terminally stuck if it is still running when a later scheduled probe arrives.
+// A later Start first stops the old loop and returns
+// [ErrProviderHealthStopTimeout] if that stuck checker still does not exit.
 // The health monitor is initially considered healthy but does not start
 // automatic checking until Start is called.
-func NewProviderHealth(checker func(ctx context.Context) bool, opts ...ProviderHealthOption) *ProviderHealth {
+func NewProviderHealth(checker func(ctx context.Context) bool, opts ...ProviderHealthOption) (*ProviderHealth, error) {
 	if checker == nil {
-		panic("tts: ProviderHealth checker must not be nil")
+		return nil, ErrNilProviderHealthChecker
 	}
 	ph := &ProviderHealth{
 		isHealthy:     true,
@@ -111,15 +136,17 @@ func NewProviderHealth(checker func(ctx context.Context) bool, opts ...ProviderH
 	for _, opt := range opts {
 		opt(ph)
 	}
-	return ph
+	return ph, nil
 }
 
 // Start begins periodic health checking in a background goroutine.
 // It runs an immediate check, then checks at the configured interval.
 // The goroutine respects both the provided ctx and Stop().
 // Calling Start on an already-running health monitor stops the previous
-// goroutine before starting a new one.
-func (ph *ProviderHealth) Start(ctx context.Context) {
+// goroutine before starting a new one. If a previous checker ignored
+// cancellation or is still draining after a timeout, Start returns
+// [ErrProviderHealthStopTimeout] instead of silently pretending to restart.
+func (ph *ProviderHealth) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -127,14 +154,26 @@ func (ph *ProviderHealth) Start(ctx context.Context) {
 	ph.lifecycleMu.Lock()
 	defer ph.lifecycleMu.Unlock()
 
-	ph.stopLocked() // ensure any previous goroutine is stopped
+	if err := ph.stopLocked(); err != nil {
+		return err
+	}
+
+	ph.mu.Lock()
+	ph.resetCheckStateLocked()
+	ph.mu.Unlock()
 
 	ctx, ph.cancel = context.WithCancel(ctx)
 	ph.done = make(chan struct{})
-	ph.checkInFlight = false
-	ph.stopOnce = sync.Once{} // reset for re-start safety
 
 	go ph.run(ctx, ph.done)
+	return nil
+}
+
+func (ph *ProviderHealth) resetCheckStateLocked() {
+	ph.checkInFlight = false
+	ph.checkerStuck = false
+	ph.activeCheckDone = nil
+	ph.timedOutCheck = nil
 }
 
 // IsHealthy reports whether the provider is currently considered healthy.
@@ -145,34 +184,63 @@ func (ph *ProviderHealth) IsHealthy() bool {
 }
 
 // Stop terminates the background health check goroutine and waits for it to exit.
+// If an in-flight checker ignores cancellation and does not exit within the
+// configured wait window, Stop returns [ErrProviderHealthStopTimeout] instead of
+// silently pretending the monitor fully stopped.
 // It is safe to call multiple times and safe to call without a preceding Start.
-func (ph *ProviderHealth) Stop() {
+func (ph *ProviderHealth) Stop() error {
 	ph.lifecycleMu.Lock()
 	defer ph.lifecycleMu.Unlock()
-	ph.stopLocked()
+	return ph.stopLocked()
 }
 
-func (ph *ProviderHealth) stopLocked() {
-	ph.stopOnce.Do(func() {
-		if ph.cancel != nil {
-			ph.cancel()
+func (ph *ProviderHealth) stopLocked() error {
+	if ph.cancel != nil {
+		ph.cancel()
+	}
+	if ph.done != nil {
+		<-ph.done
+	}
+
+	err := ph.waitForInFlightCheckerLocked()
+	ph.cancel = nil
+	ph.done = nil
+	return err
+}
+
+func (ph *ProviderHealth) waitForInFlightCheckerLocked() error {
+	deadline := time.Now().Add(ph.stopWaitTime)
+	for {
+		ph.mu.RLock()
+		inFlight := ph.checkInFlight
+		activeDone := ph.activeCheckDone
+		ph.mu.RUnlock()
+
+		if !inFlight {
+			return nil
 		}
-		if ph.done != nil {
-			<-ph.done
-			waitUntil := time.Now().Add(ph.stopWaitTime)
-			for {
-				ph.mu.RLock()
-				inFlight := ph.checkInFlight
-				ph.mu.RUnlock()
-				if !inFlight || !time.Now().Before(waitUntil) {
-					break
-				}
-				time.Sleep(1 * time.Millisecond)
+		if activeDone == nil {
+			if !time.Now().Before(deadline) {
+				return ErrProviderHealthStopTimeout
 			}
+			time.Sleep(1 * time.Millisecond)
+			continue
 		}
-		ph.cancel = nil
-		ph.done = nil
-	})
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ErrProviderHealthStopTimeout
+		}
+
+		select {
+		case <-activeDone:
+			ph.mu.Lock()
+			ph.clearActiveCheckLocked(activeDone)
+			ph.mu.Unlock()
+		case <-time.After(remaining):
+			return ErrProviderHealthStopTimeout
+		}
+	}
 }
 
 // run is the main loop for the background health check goroutine.
@@ -198,13 +266,45 @@ func (ph *ProviderHealth) run(ctx context.Context, done chan struct{}) {
 // performCheck executes a single health check and updates state accordingly.
 func (ph *ProviderHealth) performCheck(ctx context.Context) {
 	ph.mu.Lock()
+	if ph.checkerStuck {
+		ph.mu.Unlock()
+		return
+	}
+	if ph.activeCheckDone != nil {
+		if isClosed(ph.activeCheckDone) {
+			ph.clearActiveCheckLocked(ph.activeCheckDone)
+		} else if ph.timedOutCheck != nil {
+			ph.isHealthy = false
+			ph.failureCount = 0
+			ph.cooldownUntil = time.Time{}
+			ph.checkerStuck = true
+			ph.mu.Unlock()
+			return
+		}
+	}
+	if ph.checkInFlight {
+		if ph.timedOutCheck != nil {
+			if isClosed(ph.timedOutCheck) {
+				ph.clearTimedOutCheckLocked(ph.timedOutCheck)
+			} else {
+				ph.isHealthy = false
+				ph.failureCount = 0
+				ph.cooldownUntil = time.Time{}
+				ph.checkerStuck = true
+				ph.mu.Unlock()
+				return
+			}
+		}
+	}
 	if time.Now().Before(ph.cooldownUntil) || ph.checkInFlight {
 		ph.mu.Unlock()
 		return
 	}
 	checker := ph.checker
 	timeout := ph.checkTimeout
+	doneCh := make(chan struct{})
 	ph.checkInFlight = true
+	ph.activeCheckDone = doneCh
 	ph.mu.Unlock()
 
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -212,29 +312,46 @@ func (ph *ProviderHealth) performCheck(ctx context.Context) {
 
 	resultCh := make(chan bool, 1)
 	go func() {
+		defer close(doneCh)
 		ok := checker(checkCtx)
 		select {
 		case resultCh <- ok:
 		default:
 		}
-		ph.mu.Lock()
-		ph.checkInFlight = false
-		ph.mu.Unlock()
 	}()
 
 	ok := false
+	timedOut := false
+	stopped := false
 	select {
 	case ok = <-resultCh:
 	case <-ctx.Done():
-		return
+		stopped = true
 	case <-checkCtx.Done():
+		timedOut = checkCtx.Err() == context.DeadlineExceeded
+		stopped = !timedOut
 		ok = false
 	}
 
 	ph.mu.Lock()
-	defer ph.mu.Unlock()
-
+	if stopped {
+		if isClosed(doneCh) {
+			ph.clearActiveCheckLocked(doneCh)
+		}
+		ph.mu.Unlock()
+		return
+	}
 	ph.lastCheck = time.Now()
+	if timedOut {
+		if !isClosed(doneCh) {
+			ph.timedOutCheck = doneCh
+		} else {
+			ph.clearActiveCheckLocked(doneCh)
+		}
+	} else if isClosed(doneCh) {
+		ph.clearActiveCheckLocked(doneCh)
+	}
+	defer ph.mu.Unlock()
 
 	if ok {
 		ph.failureCount = 0
@@ -247,5 +364,33 @@ func (ph *ProviderHealth) performCheck(ctx context.Context) {
 		ph.isHealthy = false
 		ph.cooldownUntil = time.Now().Add(ph.cooldownTime)
 		ph.failureCount = 0 // reset for next cycle after cooldown
+	}
+}
+
+func (ph *ProviderHealth) clearTimedOutCheckLocked(done <-chan struct{}) {
+	if ph.timedOutCheck != done {
+		return
+	}
+	ph.timedOutCheck = nil
+	ph.clearActiveCheckLocked(done)
+}
+
+func (ph *ProviderHealth) clearActiveCheckLocked(done <-chan struct{}) {
+	if ph.activeCheckDone != done {
+		return
+	}
+	ph.activeCheckDone = nil
+	ph.checkInFlight = false
+	if ph.timedOutCheck == done {
+		ph.timedOutCheck = nil
+	}
+}
+
+func isClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
 	}
 }
