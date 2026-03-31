@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/simp-lee/ttsbridge/providers/volcengine"
@@ -14,15 +13,13 @@ const (
 )
 
 func init() {
-	RegisterProvider(volcengineProviderName, newVolcengineAdapter)
+	RegisterProvider(volcengineProviderName, ProviderRegistration{
+		Factory:      newVolcengineProvider,
+		DefaultVoice: volcengineDefaultVoice,
+	})
 }
 
-// volcengineAdapter adapts volcengine.Provider to ProviderAdapter
-type volcengineAdapter struct {
-	provider *volcengine.Provider
-}
-
-func newVolcengineAdapter(cfg *ProviderConfig) (ProviderAdapter, error) {
+func newVolcengineProvider(cfg *ProviderConfig) (tts.Provider, error) {
 	p := volcengine.New()
 
 	if cfg != nil {
@@ -40,33 +37,5 @@ func newVolcengineAdapter(cfg *ProviderConfig) (ProviderAdapter, error) {
 		}
 	}
 
-	return &volcengineAdapter{provider: p}, nil
-}
-
-func (a *volcengineAdapter) Name() string {
-	return volcengineProviderName
-}
-
-func (a *volcengineAdapter) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
-	return a.provider.ListVoices(ctx, locale)
-}
-
-func (a *volcengineAdapter) Synthesize(ctx context.Context, opts *SynthesizeRequest) ([]byte, error) {
-	volcOpts := &volcengine.SynthesizeOptions{
-		Text:  opts.Text,
-		Voice: opts.Voice,
-	}
-	return a.provider.Synthesize(ctx, volcOpts)
-}
-
-func (a *volcengineAdapter) DefaultVoice() string {
-	return volcengineDefaultVoice
-}
-
-func (a *volcengineAdapter) DefaultFormat() string {
-	return "wav"
-}
-
-func (a *volcengineAdapter) SupportsRateVolumePitch() bool {
-	return false
+	return p, nil
 }

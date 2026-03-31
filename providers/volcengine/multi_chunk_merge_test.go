@@ -93,12 +93,9 @@ func TestSynthesizeMultiChunkAllInvalidChunksReturnsError(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "abcdef",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("abcdef", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "no valid wav chunk header found") {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,23 +118,39 @@ func TestSynthesizeMultiChunkRebuildsWAVHeaderAndConcatenatesPCM(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1).WithMaxAttempts(1)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "ab",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("ab", "BV700_streaming"))
 	if err != nil {
 		t.Fatalf("Synthesize() error: %v", err)
 	}
 
 	wantPCM := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	if got := audioData[44:]; string(got) != string(wantPCM) {
+	if got := result.Audio[44:]; string(got) != string(wantPCM) {
 		t.Fatalf("PCM payload = %v, want %v", got, wantPCM)
 	}
-	if got := binary.LittleEndian.Uint32(audioData[4:8]); got != uint32(len(audioData)-8) {
-		t.Fatalf("RIFF size = %d, want %d", got, len(audioData)-8)
+	if got := binary.LittleEndian.Uint32(result.Audio[4:8]); got != uint32(len(result.Audio)-8) {
+		t.Fatalf("RIFF size = %d, want %d", got, len(result.Audio)-8)
 	}
-	if got := binary.LittleEndian.Uint32(audioData[40:44]); got != uint32(len(wantPCM)) {
+	if got := binary.LittleEndian.Uint32(result.Audio[40:44]); got != uint32(len(wantPCM)) {
 		t.Fatalf("data size = %d, want %d", got, len(wantPCM))
+	}
+	expectedDuration, err := tts.InferDuration(result.Audio, tts.VoiceAudioProfile{Format: tts.AudioFormatWAV})
+	if err != nil {
+		t.Fatalf("InferDuration() error: %v", err)
+	}
+	if result.Format != tts.AudioFormatWAV {
+		t.Fatalf("result.Format = %q, want %q", result.Format, tts.AudioFormatWAV)
+	}
+	if result.SampleRate != 24000 {
+		t.Fatalf("result.SampleRate = %d, want %d", result.SampleRate, 24000)
+	}
+	if result.Duration != expectedDuration {
+		t.Fatalf("result.Duration = %v, want %v", result.Duration, expectedDuration)
+	}
+	if result.Provider != "volcengine" {
+		t.Fatalf("result.Provider = %q, want %q", result.Provider, "volcengine")
+	}
+	if result.VoiceID != "BV700_streaming" {
+		t.Fatalf("result.VoiceID = %q, want %q", result.VoiceID, "BV700_streaming")
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Fatalf("calls = %d; want 2", got)
@@ -160,18 +173,60 @@ func TestSynthesizeMultiChunkRejectsMismatchedWAVProfile(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1).WithMaxAttempts(1)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "ab",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("ab", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "wav profile mismatch with first chunk") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Fatalf("calls = %d; want 2", got)
+	}
+}
+
+func TestSynthesizeSingleChunkUsesReturnedWAVMetadata(t *testing.T) {
+	chunk := makeWAVChunkWithProfileForTest(16000, 1, 16, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		resp := translateResponseStub{}
+		resp.BaseResp.StatusCode = 0
+		resp.Audio.Data = base64.StdEncoding.EncodeToString(chunk)
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := New().WithBaseURL(server.URL).WithMaxAttempts(1)
+	result, err := p.Synthesize(context.Background(), plainTextRequest("hello", "BV700_streaming"))
+	if err != nil {
+		t.Fatalf("Synthesize() error: %v", err)
+	}
+
+	expectedDuration, err := tts.InferDuration(result.Audio, tts.VoiceAudioProfile{Format: tts.AudioFormatWAV})
+	if err != nil {
+		t.Fatalf("InferDuration() error: %v", err)
+	}
+	if got := binary.LittleEndian.Uint32(result.Audio[24:28]); got != 16000 {
+		t.Fatalf("wav header sample rate = %d, want %d", got, 16000)
+	}
+	if result.Format != tts.AudioFormatWAV {
+		t.Fatalf("result.Format = %q, want %q", result.Format, tts.AudioFormatWAV)
+	}
+	if result.SampleRate != 16000 {
+		t.Fatalf("result.SampleRate = %d, want %d", result.SampleRate, 16000)
+	}
+	if result.Duration != expectedDuration {
+		t.Fatalf("result.Duration = %v, want %v", result.Duration, expectedDuration)
+	}
+	if result.Provider != "volcengine" {
+		t.Fatalf("result.Provider = %q, want %q", result.Provider, "volcengine")
+	}
+	if result.VoiceID != "BV700_streaming" {
+		t.Fatalf("result.VoiceID = %q, want %q", result.VoiceID, "BV700_streaming")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("calls = %d; want 1", got)
 	}
 }
 
@@ -192,12 +247,9 @@ func TestSynthesizeMultiChunkFirstInvalidThenValidReturnsErrorWithoutOuterRetry(
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1).WithMaxAttempts(3)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "abcdef",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("abcdef", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "no valid wav chunk header found") {
 		t.Fatalf("unexpected error: %v", err)
@@ -217,12 +269,9 @@ func TestSynthesizeMultiChunkAllInvalidHeadersReturnsError(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "abcdef",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("abcdef", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "no valid wav chunk header found") {
 		t.Fatalf("unexpected error: %v", err)
@@ -246,12 +295,9 @@ func TestSynthesizeMultiChunkInvalidHeaderThenValidReturnsErrorWithoutOuterRetry
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1).WithMaxAttempts(3)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "abcdef",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("abcdef", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "no valid wav chunk header found") {
 		t.Fatalf("unexpected error: %v", err)
@@ -271,12 +317,9 @@ func TestSynthesizeSingleChunkInvalidHeaderReturnsError(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "abc",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("abc", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "no valid wav chunk header found") {
 		t.Fatalf("unexpected error: %v", err)
@@ -299,12 +342,9 @@ func TestSynthesizeSingleChunkInvalidHeaderThenValidReturnsErrorWithoutOuterRetr
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxAttempts(3)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "abc",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("abc", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "no valid wav chunk header found") {
 		t.Fatalf("unexpected error: %v", err)
@@ -331,12 +371,9 @@ func TestSynthesizeMultiChunkFailureIncludesChunkContext(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxTextBytes(1).WithMaxAttempts(1)
-	audioData, err := p.Synthesize(context.Background(), &SynthesizeOptions{
-		Text:  "ab",
-		Voice: "BV700_streaming",
-	})
+	result, err := p.Synthesize(context.Background(), plainTextRequest("ab", "BV700_streaming"))
 	if err == nil {
-		t.Fatalf("expected error, got nil with audio len=%d", len(audioData))
+		t.Fatalf("expected error, got nil with audio len=%d", len(result.Audio))
 	}
 	if !strings.Contains(err.Error(), "chunk 2/2 failed") {
 		t.Fatalf("unexpected error: %v", err)

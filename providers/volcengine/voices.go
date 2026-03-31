@@ -3,8 +3,8 @@ package volcengine
 import "github.com/simp-lee/ttsbridge/tts"
 
 // voiceWithExtra 辅助函数，创建带 Extra 的 Voice
-func voiceWithExtra(id, name string, language tts.Language, gender tts.Gender, category string) tts.Voice {
-	return tts.Voice{
+func voiceWithExtra(id, name string, language tts.Language, gender tts.Gender, category string, extraLanguages ...tts.Language) tts.Voice {
+	voice := tts.Voice{
 		ID:       id,
 		Name:     name,
 		Language: language,
@@ -12,11 +12,17 @@ func voiceWithExtra(id, name string, language tts.Language, gender tts.Gender, c
 		Provider: providerName,
 		Extra: &VoiceExtra{
 			Category:          category,
-			Format:            "wav",  // WAV容器, PCM_S16LE编码
+			Format:            "wav", // WAV容器, PCM_S16LE编码
 			SampleRate:        24000,
-			SupportsStreaming: true,
+			SupportsStreaming: false,
 		},
 	}
+	if len(extraLanguages) > 0 {
+		voice.Languages = make([]tts.Language, 0, len(extraLanguages)+1)
+		voice.Languages = append(voice.Languages, language)
+		voice.Languages = append(voice.Languages, extraLanguages...)
+	}
+	return voice
 }
 
 // GetAllVoices 返回火山翻译 TTS 支持的所有可用语音（21款免费音色）
@@ -24,7 +30,7 @@ func voiceWithExtra(id, name string, language tts.Language, gender tts.Gender, c
 func GetAllVoices() []tts.Voice {
 	return []tts.Voice{
 		// 通用场景 (3款)
-		voiceWithExtra("BV700_streaming", "灿灿", tts.LanguageZhCN, tts.GenderFemale, "通用场景"),
+		voiceWithExtra("BV700_streaming", "灿灿", tts.LanguageZhCN, tts.GenderFemale, "通用场景", tts.LanguageEnUS, tts.LanguageJaJP, tts.LanguagePtBR, tts.LanguageEsMX, tts.LanguageIDID),
 		voiceWithExtra("BV001_streaming", "通用女声", tts.LanguageZhCN, tts.GenderFemale, "通用场景"),
 		voiceWithExtra("BV002_streaming", "通用男声", tts.LanguageZhCN, tts.GenderMale, "通用场景"),
 
@@ -40,7 +46,7 @@ func GetAllVoices() []tts.Voice {
 		voiceWithExtra("BV056_streaming", "阳光男声", tts.LanguageZhCN, tts.GenderMale, "智能助手/视频配音/特色/教育"),
 		voiceWithExtra("BV005_streaming", "活泼女声", tts.LanguageZhCN, tts.GenderFemale, "智能助手/视频配音/特色/教育"),
 		voiceWithExtra("BV051_streaming", "奶气萌娃", tts.LanguageZhCN, tts.GenderFemale, "智能助手/视频配音/特色/教育"),
-		voiceWithExtra("BV034_streaming", "知性姐姐-双语", tts.LanguageZhCN, tts.GenderFemale, "智能助手/视频配音/特色/教育"),
+		voiceWithExtra("BV034_streaming", "知性姐姐-双语", tts.LanguageZhCN, tts.GenderFemale, "智能助手/视频配音/特色/教育", tts.LanguageEnUS),
 		voiceWithExtra("BV033_streaming", "温柔小哥", tts.LanguageZhCN, tts.GenderMale, "智能助手/视频配音/特色/教育"),
 
 		// 方言 (3款)
@@ -56,15 +62,4 @@ func GetAllVoices() []tts.Voice {
 		voiceWithExtra("BV522_streaming", "气质女生", tts.LanguageJaJP, tts.GenderFemale, "日语"),
 		voiceWithExtra("BV524_streaming", "日语男声", tts.LanguageJaJP, tts.GenderMale, "日语"),
 	}
-}
-
-// GetVoiceByName 根据名称获取语音
-func GetVoiceByName(name string) *tts.Voice {
-	allVoices := GetAllVoices()
-	for _, voice := range allVoices {
-		if voice.Name == name || voice.ID == name {
-			return &voice
-		}
-	}
-	return nil
 }

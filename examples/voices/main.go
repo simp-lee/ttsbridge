@@ -6,6 +6,7 @@ import (
 	"log"
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
+	"github.com/simp-lee/ttsbridge/tts"
 )
 
 func main() {
@@ -16,7 +17,7 @@ func main() {
 
 	// 列出所有中文语音
 	log.Println("正在获取可用语音列表...")
-	voices, err := provider.ListVoices(ctx, "zh-CN")
+	voices, err := provider.ListVoices(ctx, tts.VoiceFilter{Language: "zh-CN"})
 	if err != nil {
 		log.Fatalf("获取语音列表失败: %v", err)
 	}
@@ -31,7 +32,7 @@ func main() {
 	}
 
 	// 列出所有英文语音
-	voices, err = provider.ListVoices(ctx, "en-US")
+	voices, err = provider.ListVoices(ctx, tts.VoiceFilter{Language: "en-US"})
 	if err != nil {
 		log.Fatalf("获取语音列表失败: %v", err)
 	}
@@ -46,7 +47,7 @@ func main() {
 	}
 
 	// 列出所有语音
-	allVoices, err := provider.ListVoices(ctx, "")
+	allVoices, err := provider.ListVoices(ctx, tts.VoiceFilter{})
 	if err != nil {
 		log.Fatalf("获取语音列表失败: %v", err)
 	}

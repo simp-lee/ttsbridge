@@ -383,9 +383,65 @@ func TestFormatRegistry_ProbeAll(t *testing.T) {
 	if unavailable != 1 {
 		t.Errorf("unavailable = %d; want 1", unavailable)
 	}
-	// Prober should have been called exactly 3 times (only unverified formats)
+	// Prober should have been called exactly 3 times (only eligible formats)
 	if prober.callCount() != 3 {
 		t.Errorf("prober called %d times; want 3", prober.callCount())
+	}
+}
+
+func TestFormatRegistry_ProbeAll_ReprobesExpiredVerifiedFormats(t *testing.T) {
+	prober := newMockProber(map[string]bool{
+		"stale-available":   false,
+		"stale-unavailable": true,
+	})
+	r := NewFormatRegistry(
+		WithProber(prober),
+		WithProbeTTL(1*time.Hour),
+		WithProbeInterval(1*time.Millisecond),
+	)
+	r.Register(
+		OutputFormat{ID: "stale-available", Status: FormatAvailable, VerifiedAt: time.Now().Add(-2 * time.Hour)},
+		OutputFormat{ID: "stale-unavailable", Status: FormatUnavailable, VerifiedAt: time.Now().Add(-2 * time.Hour)},
+		OutputFormat{ID: "fresh", Status: FormatAvailable, VerifiedAt: time.Now()},
+	)
+	r.RegisterConstant("constant", VoiceAudioProfile{Format: "mp3"})
+
+	available, unavailable, err := r.ProbeAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProbeAll() error: %v", err)
+	}
+	if available != 1 {
+		t.Fatalf("available = %d; want 1", available)
+	}
+	if unavailable != 1 {
+		t.Fatalf("unavailable = %d; want 1", unavailable)
+	}
+	if prober.callCount() != 2 {
+		t.Fatalf("prober called %d times; want 2 stale formats", prober.callCount())
+	}
+
+	staleAvailable, ok := r.Get("stale-available")
+	if !ok {
+		t.Fatal("expected stale-available to remain registered")
+	}
+	if staleAvailable.Status != FormatUnavailable {
+		t.Fatalf("stale-available status = %v; want FormatUnavailable", staleAvailable.Status)
+	}
+
+	staleUnavailable, ok := r.Get("stale-unavailable")
+	if !ok {
+		t.Fatal("expected stale-unavailable to remain registered")
+	}
+	if staleUnavailable.Status != FormatAvailable {
+		t.Fatalf("stale-unavailable status = %v; want FormatAvailable", staleUnavailable.Status)
+	}
+
+	fresh, ok := r.Get("fresh")
+	if !ok {
+		t.Fatal("expected fresh to remain registered")
+	}
+	if fresh.Status != FormatAvailable {
+		t.Fatalf("fresh status = %v; want FormatAvailable", fresh.Status)
 	}
 }
 

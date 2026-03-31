@@ -7,75 +7,80 @@ import (
 
 	"github.com/simp-lee/ttsbridge/providers/edgetts"
 	"github.com/simp-lee/ttsbridge/providers/volcengine"
+	"github.com/simp-lee/ttsbridge/tts"
 )
 
 func main() {
 	ctx := context.Background()
 
-	// 示例 1: 查询 Provider 支持的输出格式列表
-	example1_DiscoverFormats()
+	// 示例 1: 查询统一输出能力
+	example1ShowCapabilities()
 
 	// 示例 2: 使用 OutputFormat 选择输出格式
-	example2_SelectOutputFormat(ctx)
+	example2SelectOutputFormat(ctx)
 }
 
-// 示例 1: 通过 OutputOptions() 查看推荐输出格式目录
-func example1_DiscoverFormats() {
-	fmt.Println("=== 示例 1: 查看推荐输出格式目录 ===")
+// 示例 1: 查看统一输出能力
+func example1ShowCapabilities() {
+	fmt.Println("=== 示例 1: 查看统一输出能力 ===")
 
-	// EdgeTTS: OutputOptions 提供推荐目录，不代表当前环境已经 probe 验证。
-	fmt.Println("\nEdgeTTS 推荐输出格式目录:")
-	edgeProvider := edgetts.New()
-	for _, opt := range edgeProvider.OutputOptions() {
-		defaultMark := ""
-		if opt.IsDefault {
-			defaultMark = " (默认)"
-		}
-		fmt.Printf("  %-45s %-25s %s%s\n", opt.FormatID, opt.Label, opt.Description, defaultMark)
-	}
-	fmt.Println("  提示: 如需得到当前环境已验证可用的格式，请先调用 FormatRegistry().ProbeAll(ctx)，再读取 SupportedFormats().")
-
-	// Volcengine: 固定 WAV 无损
-	fmt.Println("\nVolcengine 支持的输出格式:")
-	volcProvider := volcengine.New()
-	for _, opt := range volcProvider.OutputOptions() {
-		fmt.Printf("  %-45s %-25s %s\n", opt.FormatID, opt.Label, opt.Description)
-	}
+	printCapabilities("EdgeTTS", edgetts.New().Capabilities())
+	printCapabilities("Volcengine", volcengine.New().Capabilities())
 }
 
-// 示例 2: 使用 FormatID 选择输出格式
-func example2_SelectOutputFormat(ctx context.Context) {
+func printCapabilities(name string, caps tts.ProviderCapabilities) {
+	fmt.Printf("\n%s\n", name)
+	fmt.Printf("  SupportedFormats: %v\n", caps.SupportedFormats)
+	fmt.Printf("  PreferredAudioFormat: %s\n", caps.PreferredAudioFormat)
+}
+
+// 示例 2: 使用共享 OutputFormat 选择最终输出容器
+func example2SelectOutputFormat(ctx context.Context) {
 	fmt.Println("\n=== 示例 2: 选择输出格式 ===")
 
 	provider := edgetts.New()
-
-	// 使用高音质格式: MP3 48kHz 192kbps
-	opts := &edgetts.SynthesizeOptions{
-		Text:         "这是一段使用高音质输出的测试文本。",
-		Voice:        "zh-CN-XiaoxiaoNeural",
-		OutputFormat: edgetts.OutputFormatMP3_48khz_192k,
+	caps := provider.Capabilities()
+	fmt.Printf("EdgeTTS 当前共享输出能力: %v\n", caps.SupportedFormats)
+	if !caps.SupportsFormat(tts.AudioFormatWAV) {
+		_, err := provider.Synthesize(ctx, tts.SynthesisRequest{
+			InputMode:    tts.InputModePlainText,
+			Text:         "这段文本不会发送到服务端，因为共享层不支持 WAV。",
+			VoiceID:      "zh-CN-XiaoxiaoNeural",
+			OutputFormat: tts.AudioFormatWAV,
+		})
+		if err != nil {
+			fmt.Printf("显式请求 WAV 会被快速拒绝: %v\n", err)
+		}
 	}
 
-	audio, err := provider.Synthesize(ctx, opts)
+	// Edge live 当前只对共享层声明 MP3。
+	request := tts.SynthesisRequest{
+		InputMode:    tts.InputModePlainText,
+		Text:         "这是一段显式使用 MP3 输出的测试文本。",
+		VoiceID:      "zh-CN-XiaoxiaoNeural",
+		OutputFormat: tts.AudioFormatMP3,
+	}
+
+	result, err := provider.Synthesize(ctx, request)
 	if err != nil {
 		log.Printf("合成失败: %v", err)
 		return
 	}
 
-	fmt.Printf("MP3 48kHz 192kbps 生成音频: %d 字节\n", len(audio))
+	fmt.Printf("显式 MP3 生成音频: %d 字节 (格式=%s, 采样率=%d, 时长=%s)\n", len(result.Audio), result.Format, result.SampleRate, result.Duration)
 
 	// 对比: 使用默认格式 (不设置 OutputFormat)
-	optsDefault := &edgetts.SynthesizeOptions{
-		Text:  "这是一段使用默认格式的测试文本。",
-		Voice: "zh-CN-XiaoxiaoNeural",
+	defaultRequest := tts.SynthesisRequest{
+		InputMode: tts.InputModePlainText,
+		Text:      "这是一段使用默认格式的测试文本。",
+		VoiceID:   "zh-CN-XiaoxiaoNeural",
 	}
 
-	audioDefault, err := provider.Synthesize(ctx, optsDefault)
+	defaultResult, err := provider.Synthesize(ctx, defaultRequest)
 	if err != nil {
 		log.Printf("合成失败: %v", err)
 		return
 	}
 
-	fmt.Printf("默认格式 (MP3 24kHz 48kbps) 生成音频: %d 字节\n", len(audioDefault))
-	fmt.Printf("高音质比默认大约 %.1f 倍\n", float64(len(audio))/float64(len(audioDefault)))
+	fmt.Printf("默认格式 (%s) 生成音频: %d 字节\n", defaultResult.Format, len(defaultResult.Audio))
 }

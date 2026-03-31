@@ -14,24 +14,55 @@ import (
 )
 
 type testAdapter struct {
-	name string
+	name         string
+	capabilities tts.ProviderCapabilities
 }
 
 func (a *testAdapter) Name() string { return a.name }
 
-func (a *testAdapter) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
-	return []tts.Voice{{ID: "voice-1", Language: tts.Language(locale), Provider: a.name}}, nil
+func testProviderCapabilities(prosody bool, format string) tts.ProviderCapabilities {
+	return tts.ProviderCapabilities{
+		ProsodyParams:        prosody,
+		SupportedFormats:     []string{format},
+		PreferredAudioFormat: format,
+	}
 }
 
-func (a *testAdapter) Synthesize(ctx context.Context, opts *SynthesizeRequest) ([]byte, error) {
-	return []byte(opts.Text), nil
+func (a *testAdapter) Capabilities() tts.ProviderCapabilities {
+	if a.capabilities.PreferredAudioFormat == "" && len(a.capabilities.SupportedFormats) == 0 {
+		return testProviderCapabilities(true, tts.AudioFormatMP3)
+	}
+	return a.capabilities.Clone()
 }
 
-func (a *testAdapter) DefaultVoice() string { return "voice-1" }
+func (a *testAdapter) ListVoices(ctx context.Context, filter tts.VoiceFilter) ([]tts.Voice, error) {
+	_ = ctx
+	voices := []tts.Voice{{ID: "voice-1", Language: tts.Language("en-US"), Provider: a.name}}
+	if filter.Language != "" {
+		voices[0].Language = tts.Language(filter.Language)
+	}
+	return tts.FilterVoices(voices, filter), nil
+}
 
-func (a *testAdapter) DefaultFormat() string { return "mp3" }
+func (a *testAdapter) Synthesize(ctx context.Context, request tts.SynthesisRequest) (*tts.SynthesisResult, error) {
+	_ = ctx
+	content := request.Text
+	if request.InputMode == tts.InputModeRawSSML {
+		content = request.SSML
+	}
+	return &tts.SynthesisResult{
+		Audio:    []byte(content),
+		Format:   request.ResolvedOutputFormat(a.Capabilities()),
+		Provider: a.name,
+		VoiceID:  request.VoiceID,
+	}, nil
+}
 
-func (a *testAdapter) SupportsRateVolumePitch() bool { return true }
+func (a *testAdapter) SynthesizeStream(ctx context.Context, request tts.SynthesisRequest) (tts.AudioStream, error) {
+	_ = ctx
+	_ = request
+	return nil, errors.New("not implemented")
+}
 
 func TestProviderRegistry_DefaultProvidersRegistered(t *testing.T) {
 	providers := ListProviders()
@@ -54,9 +85,12 @@ func TestProviderRegistry_DefaultProvidersRegistered(t *testing.T) {
 
 func TestProviderRegistry_RegisterAndGetProvider(t *testing.T) {
 	providerName := "test-provider-registry"
-	RegisterProvider(providerName, func(cfg *ProviderConfig) (ProviderAdapter, error) {
-		_ = cfg
-		return &testAdapter{name: providerName}, nil
+	RegisterProvider(providerName, ProviderRegistration{
+		Factory: func(cfg *ProviderConfig) (tts.Provider, error) {
+			_ = cfg
+			return &testAdapter{name: providerName}, nil
+		},
+		DefaultVoice: "voice-1",
 	})
 
 	adapter, err := GetProvider(providerName, &ProviderConfig{})
@@ -69,8 +103,11 @@ func TestProviderRegistry_RegisterAndGetProvider(t *testing.T) {
 	if adapter.Name() != providerName {
 		t.Fatalf("adapter.Name() = %q, want %q", adapter.Name(), providerName)
 	}
+	if GetProviderDefaultVoice(providerName) != "voice-1" {
+		t.Fatalf("GetProviderDefaultVoice(%q) = %q, want %q", providerName, GetProviderDefaultVoice(providerName), "voice-1")
+	}
 
-	voices, err := adapter.ListVoices(context.Background(), "en-US")
+	voices, err := adapter.ListVoices(context.Background(), tts.VoiceFilter{Language: "en-US"})
 	if err != nil {
 		t.Fatalf("ListVoices() error: %v", err)
 	}
@@ -78,12 +115,18 @@ func TestProviderRegistry_RegisterAndGetProvider(t *testing.T) {
 		t.Fatalf("ListVoices() = %+v, want provider %q", voices, providerName)
 	}
 
-	audio, err := adapter.Synthesize(context.Background(), &SynthesizeRequest{Text: "hello"})
+	result, err := adapter.Synthesize(context.Background(), tts.SynthesisRequest{
+		InputMode: tts.InputModePlainText,
+		Text:      "hello",
+	})
 	if err != nil {
 		t.Fatalf("Synthesize() error: %v", err)
 	}
-	if string(audio) != "hello" {
-		t.Fatalf("Synthesize() audio = %q, want %q", string(audio), "hello")
+	if string(result.Audio) != "hello" {
+		t.Fatalf("Synthesize() audio = %q, want %q", string(result.Audio), "hello")
+	}
+	if result.Format != tts.AudioFormatMP3 {
+		t.Fatalf("Synthesize() format = %q, want %q", result.Format, tts.AudioFormatMP3)
 	}
 }
 
@@ -101,9 +144,12 @@ func TestProviderRegistry_RegisterProviderPanicsOnDuplicateName(t *testing.T) {
 	withTestRegistry(t, map[string]ProviderFactory{})
 
 	providerName := "duplicate-provider"
-	RegisterProvider(providerName, func(cfg *ProviderConfig) (ProviderAdapter, error) {
-		_ = cfg
-		return &testAdapter{name: providerName}, nil
+	RegisterProvider(providerName, ProviderRegistration{
+		Factory: func(cfg *ProviderConfig) (tts.Provider, error) {
+			_ = cfg
+			return &testAdapter{name: providerName}, nil
+		},
+		DefaultVoice: "voice-1",
 	})
 
 	defer func() {
@@ -116,15 +162,18 @@ func TestProviderRegistry_RegisterProviderPanicsOnDuplicateName(t *testing.T) {
 		}
 	}()
 
-	RegisterProvider(providerName, func(cfg *ProviderConfig) (ProviderAdapter, error) {
-		_ = cfg
-		return &testAdapter{name: providerName + "-other"}, nil
+	RegisterProvider(providerName, ProviderRegistration{
+		Factory: func(cfg *ProviderConfig) (tts.Provider, error) {
+			_ = cfg
+			return &testAdapter{name: providerName + "-other"}, nil
+		},
+		DefaultVoice: "voice-2",
 	})
 }
 
 func TestProviderRegistry_GetProviderReturnsFactoryError(t *testing.T) {
 	withTestRegistry(t, map[string]ProviderFactory{
-		"broken": func(cfg *ProviderConfig) (ProviderAdapter, error) {
+		"broken": func(cfg *ProviderConfig) (tts.Provider, error) {
 			_ = cfg
 			return nil, errors.New("invalid config")
 		},
@@ -161,18 +210,18 @@ func TestValidateProxyURL(t *testing.T) {
 	}
 }
 
-func TestProviderRegistry_GenericProvidersAndAdaptersRemainCompatible(t *testing.T) {
-	var _ tts.Provider[*edgetts.SynthesizeOptions] = (*edgetts.Provider)(nil)
-	var _ tts.Provider[*volcengine.SynthesizeOptions] = (*volcengine.Provider)(nil)
+func TestProviderRegistry_UnifiedProvidersRemainCompatible(t *testing.T) {
+	var _ tts.Provider = (*edgetts.Provider)(nil)
+	var _ tts.Provider = (*volcengine.Provider)(nil)
 
 	tests := []struct {
 		providerName      string
-		wantAdapterName   string
+		wantProviderName  string
 		wantDefaultFormat string
 		wantRVP           bool
 	}{
-		{providerName: "edgetts", wantAdapterName: "edgetts", wantDefaultFormat: "mp3", wantRVP: true},
-		{providerName: "volcengine", wantAdapterName: "volcengine", wantDefaultFormat: "wav", wantRVP: false},
+		{providerName: "edgetts", wantProviderName: "edgetts", wantDefaultFormat: "mp3", wantRVP: true},
+		{providerName: "volcengine", wantProviderName: "volcengine", wantDefaultFormat: "wav", wantRVP: false},
 	}
 
 	for _, tt := range tests {
@@ -185,17 +234,18 @@ func TestProviderRegistry_GenericProvidersAndAdaptersRemainCompatible(t *testing
 			if adapter == nil {
 				t.Fatalf("GetProvider(%q) returned nil", tt.providerName)
 			}
-			if adapter.Name() != tt.wantAdapterName {
-				t.Fatalf("adapter.Name() = %q, want %q", adapter.Name(), tt.wantAdapterName)
+			if adapter.Name() != tt.wantProviderName {
+				t.Fatalf("adapter.Name() = %q, want %q", adapter.Name(), tt.wantProviderName)
 			}
-			if adapter.DefaultVoice() == "" {
-				t.Fatalf("adapter.DefaultVoice() should not be empty for %q", tt.providerName)
+			if GetProviderDefaultVoice(tt.providerName) == "" {
+				t.Fatalf("GetProviderDefaultVoice(%q) should not be empty", tt.providerName)
 			}
-			if adapter.DefaultFormat() != tt.wantDefaultFormat {
-				t.Fatalf("adapter.DefaultFormat() = %q, want %q", adapter.DefaultFormat(), tt.wantDefaultFormat)
+			capabilities := adapter.Capabilities()
+			if capabilities.ResolvedOutputFormat("") != tt.wantDefaultFormat {
+				t.Fatalf("adapter.Capabilities().ResolvedOutputFormat(empty) = %q, want %q", capabilities.ResolvedOutputFormat(""), tt.wantDefaultFormat)
 			}
-			if adapter.SupportsRateVolumePitch() != tt.wantRVP {
-				t.Fatalf("adapter.SupportsRateVolumePitch() = %v, want %v", adapter.SupportsRateVolumePitch(), tt.wantRVP)
+			if capabilities.ProsodyParams != tt.wantRVP {
+				t.Fatalf("adapter.Capabilities().ProsodyParams = %v, want %v", capabilities.ProsodyParams, tt.wantRVP)
 			}
 		})
 	}

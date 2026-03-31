@@ -1244,7 +1244,7 @@ func TestClassifyWebsocketReadError_ClassifiesUnsupportedOutputFormatCloseReason
 	}
 }
 
-func TestFormatRegistryProbeAll_ClassifiesServiceUnsupportedFormatsAsUnavailable(t *testing.T) {
+func newProbeAllTestProvider() *Provider {
 	p := New()
 	r := tts.NewFormatRegistry(
 		tts.WithProfileParser(ParseOutputFormat),
@@ -1255,45 +1255,93 @@ func TestFormatRegistryProbeAll_ClassifiesServiceUnsupportedFormatsAsUnavailable
 		tts.OutputFormat{ID: OutputFormatMP3_48khz_192k, Status: tts.FormatUnverified},
 	)
 	p.WithFormatRegistry(r)
+	return p
+}
 
-	attempts := map[string]int{}
-	p.connectHook = func(context.Context) (*websocket.Conn, error) {
+func newProbeAllConnectHook(t *testing.T, attempts map[string]int) func(context.Context) (*websocket.Conn, error) {
+	t.Helper()
+
+	return func(context.Context) (*websocket.Conn, error) {
 		return newTestWebsocketConn(t, func(ctx context.Context, ws *websocket.Conn) {
-			_, configMessage, err := ws.Read(ctx)
-			if err != nil {
+			handleProbeAllSession(t, ctx, ws, attempts)
+		}), nil
+	}
+}
+
+func handleProbeAllSession(t *testing.T, ctx context.Context, ws *websocket.Conn, attempts map[string]int) {
+	t.Helper()
+
+	formatID, ok := readProbeAllFormatID(t, ctx, ws)
+	if !ok {
+		return
+	}
+	attempts[formatID]++
+	if !readProbeAllSSMLMessage(t, ctx, ws) {
+		return
+	}
+	if formatID == OutputFormatMP3_48khz_192k {
+		closeUnsupportedProbeAllSession(t, ws, formatID)
+		return
+	}
+	writeAvailableProbeAllResponse(t, ctx, ws)
+}
+
+func readProbeAllFormatID(t *testing.T, ctx context.Context, ws *websocket.Conn) (string, bool) {
+	t.Helper()
+
+	_, configMessage, err := ws.Read(ctx)
+	if err != nil {
+		t.Errorf("read config: %v", err)
+		return "", false
+	}
+
+	config := string(configMessage)
+	switch {
+	case strings.Contains(config, OutputFormatMP3_24khz_48k):
+		return OutputFormatMP3_24khz_48k, true
+	case strings.Contains(config, OutputFormatMP3_48khz_192k):
+		return OutputFormatMP3_48khz_192k, true
+	default:
+		t.Errorf("unexpected config message: %s", config)
+		return "", false
+	}
+}
+
+func readProbeAllSSMLMessage(t *testing.T, ctx context.Context, ws *websocket.Conn) bool {
+	t.Helper()
+
+	_, ssmlMessage, err := ws.Read(ctx)
+	if err != nil {
+		t.Errorf("read ssml: %v", err)
+		return false
+	}
+	if !strings.Contains(string(ssmlMessage), ">test<") {
+		t.Errorf("ssml message did not contain probe text: %s", string(ssmlMessage))
+		return false
+	}
+	return true
+}
+
+func TestEdgeTTSProber_ProbeFormatUsesDefaultProsodySSML(t *testing.T) {
+	provider := New()
+	provider.connectHook = func(context.Context) (*websocket.Conn, error) {
+		return newTestWebsocketConn(t, func(ctx context.Context, ws *websocket.Conn) {
+			if _, _, err := ws.Read(ctx); err != nil {
 				t.Errorf("read config: %v", err)
 				return
 			}
-
-			config := string(configMessage)
-			formatID := ""
-			switch {
-			case strings.Contains(config, OutputFormatMP3_24khz_48k):
-				formatID = OutputFormatMP3_24khz_48k
-			case strings.Contains(config, OutputFormatMP3_48khz_192k):
-				formatID = OutputFormatMP3_48khz_192k
-			default:
-				t.Errorf("unexpected config message: %s", config)
-				return
-			}
-			attempts[formatID]++
 
 			_, ssmlMessage, err := ws.Read(ctx)
 			if err != nil {
 				t.Errorf("read ssml: %v", err)
 				return
 			}
-			if !strings.Contains(string(ssmlMessage), ">test<") {
-				t.Errorf("ssml message did not contain probe text: %s", string(ssmlMessage))
-				return
-			}
 
-			if formatID == OutputFormatMP3_48khz_192k {
-				closeErr := ws.Close(websocket.StatusInvalidFramePayloadData, "Unsupported Edge output format: "+formatID+".")
-				if closeErr != nil {
-					t.Errorf("close websocket: %v", closeErr)
+			ssml := string(ssmlMessage)
+			for _, want := range []string{">test<", "rate='+0%'", "volume='+0%'", "pitch='+0Hz'"} {
+				if !strings.Contains(ssml, want) {
+					t.Errorf("probe ssml missing %q: %s", want, ssml)
 				}
-				return
 			}
 
 			if err := ws.Write(ctx, websocket.MessageBinary, []byte{0x00, 0x00, 'o', 'k'}); err != nil {
@@ -1306,44 +1354,92 @@ func TestFormatRegistryProbeAll_ClassifiesServiceUnsupportedFormatsAsUnavailable
 		}), nil
 	}
 
-	available, unavailable, err := p.FormatRegistry().ProbeAll(context.Background())
+	available, err := (&edgeTTSProber{provider: provider}).ProbeFormat(context.Background(), OutputFormatMP3_24khz_48k)
 	if err != nil {
-		t.Fatalf("ProbeAll() error: %v", err)
+		t.Fatalf("ProbeFormat() error: %v", err)
 	}
+	if !available {
+		t.Fatal("ProbeFormat() = false, want true")
+	}
+}
+
+func closeUnsupportedProbeAllSession(t *testing.T, ws *websocket.Conn, formatID string) {
+	t.Helper()
+
+	if err := ws.Close(websocket.StatusInvalidFramePayloadData, "Unsupported Edge output format: "+formatID+"."); err != nil {
+		t.Errorf("close websocket: %v", err)
+	}
+}
+
+func writeAvailableProbeAllResponse(t *testing.T, ctx context.Context, ws *websocket.Conn) {
+	t.Helper()
+
+	if err := ws.Write(ctx, websocket.MessageBinary, []byte{0x00, 0x00, 'o', 'k'}); err != nil {
+		t.Errorf("write audio: %v", err)
+		return
+	}
+	if err := ws.Write(ctx, websocket.MessageText, []byte("Path:turn.end\r\n\r\n")); err != nil {
+		t.Errorf("write turn.end: %v", err)
+	}
+}
+
+func assertServiceUnsupportedProbeAllCounts(t *testing.T, available, unavailable int) {
+	t.Helper()
+
 	if available != 1 {
 		t.Fatalf("available = %d; want 1", available)
 	}
 	if unavailable != 1 {
 		t.Fatalf("unavailable = %d; want 1", unavailable)
 	}
+}
+
+func assertProbeAllAttempts(t *testing.T, attempts map[string]int) {
+	t.Helper()
+
 	if attempts[OutputFormatMP3_24khz_48k] != 1 {
 		t.Fatalf("available format attempts = %d; want 1", attempts[OutputFormatMP3_24khz_48k])
 	}
 	if attempts[OutputFormatMP3_48khz_192k] != 1 {
 		t.Fatalf("unsupported format attempts = %d; want 1", attempts[OutputFormatMP3_48khz_192k])
 	}
+}
 
-	availableFormat, ok := p.FormatRegistry().Get(OutputFormatMP3_24khz_48k)
+func assertRegistryFormatStatus(t *testing.T, registry *tts.FormatRegistry, formatID string, wantStatus tts.FormatStatus, wantVerifiedAt bool) {
+	t.Helper()
+
+	format, ok := registry.Get(formatID)
 	if !ok {
-		t.Fatalf("expected %q in registry", OutputFormatMP3_24khz_48k)
+		t.Fatalf("expected %q in registry", formatID)
 	}
-	if availableFormat.Status != tts.FormatAvailable {
-		t.Fatalf("status(%q) = %v; want %v", OutputFormatMP3_24khz_48k, availableFormat.Status, tts.FormatAvailable)
+	if format.Status != wantStatus {
+		t.Fatalf("status(%q) = %v; want %v", formatID, format.Status, wantStatus)
 	}
+	if wantVerifiedAt && format.VerifiedAt.IsZero() {
+		t.Fatalf("verified_at for %q should be set", formatID)
+	}
+}
 
-	unsupportedFormat, ok := p.FormatRegistry().Get(OutputFormatMP3_48khz_192k)
-	if !ok {
-		t.Fatalf("expected %q in registry", OutputFormatMP3_48khz_192k)
-	}
-	if unsupportedFormat.Status != tts.FormatUnavailable {
-		t.Fatalf("status(%q) = %v; want %v", OutputFormatMP3_48khz_192k, unsupportedFormat.Status, tts.FormatUnavailable)
-	}
-	if unsupportedFormat.VerifiedAt.IsZero() {
-		t.Fatalf("verified_at for %q should be set", OutputFormatMP3_48khz_192k)
-	}
+func assertSupportedFormatsOnlyContain(t *testing.T, formats []tts.OutputFormat, wantID string) {
+	t.Helper()
 
-	supported := p.SupportedFormats()
-	if len(supported) != 1 || supported[0].ID != OutputFormatMP3_24khz_48k {
-		t.Fatalf("SupportedFormats() = %+v; want only %q", supported, OutputFormatMP3_24khz_48k)
+	if len(formats) != 1 || formats[0].ID != wantID {
+		t.Fatalf("SupportedFormats() = %+v; want only %q", formats, wantID)
 	}
+}
+
+func TestFormatRegistryProbeAll_ClassifiesServiceUnsupportedFormatsAsUnavailable(t *testing.T) {
+	p := newProbeAllTestProvider()
+	attempts := map[string]int{}
+	p.connectHook = newProbeAllConnectHook(t, attempts)
+
+	available, unavailable, err := p.FormatRegistry().ProbeAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProbeAll() error: %v", err)
+	}
+	assertServiceUnsupportedProbeAllCounts(t, available, unavailable)
+	assertProbeAllAttempts(t, attempts)
+	assertRegistryFormatStatus(t, p.FormatRegistry(), OutputFormatMP3_24khz_48k, tts.FormatAvailable, false)
+	assertRegistryFormatStatus(t, p.FormatRegistry(), OutputFormatMP3_48khz_192k, tts.FormatUnavailable, true)
+	assertSupportedFormatsOnlyContain(t, p.SupportedFormats(), OutputFormatMP3_24khz_48k)
 }

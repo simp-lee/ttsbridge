@@ -23,7 +23,7 @@ func TestFormatProsody(t *testing.T) {
 		expected string
 	}{
 		{"默认值 (1.0)", 1.0, "+0%"},
-		{"零值", 0, "+0%"},
+		{"零值", 0, "-100%"},
 		{"提高 50%", 1.5, "+50%"},
 		{"提高 100% (翻倍)", 2.0, "+100%"},
 		{"降低 50%", 0.5, "-50%"},
@@ -87,7 +87,7 @@ func TestFormatPitch(t *testing.T) {
 		expected string
 	}{
 		{"默认值 (1.0)", 1.0, "+0Hz"},
-		{"零值", 0, "+0Hz"},
+		{"零值", 0, "-100%"},
 		{"提高 50%", 1.5, "+50%"},
 		{"降低 50%", 0.5, "-50%"},
 	}
@@ -102,16 +102,140 @@ func TestFormatPitch(t *testing.T) {
 	}
 }
 
+func requestFromOptions(opts *synthesizeOptions) tts.SynthesisRequest {
+	if opts == nil {
+		return tts.SynthesisRequest{}
+	}
+	request := tts.SynthesisRequest{
+		InputMode:          tts.InputModePlainText,
+		Text:               opts.Text,
+		VoiceID:            opts.Voice,
+		NeedBoundaryEvents: opts.WordBoundaryEnabled || opts.SentenceBoundaryEnabled || opts.BoundaryCallback != nil,
+	}
+	if (opts.Rate != 0 && opts.Rate != 1.0) || (opts.Volume != 0 && opts.Volume != 1.0) || (opts.Pitch != 0 && opts.Pitch != 1.0) {
+		request.InputMode = tts.InputModePlainTextWithProsody
+		request.Prosody = tts.ProsodyParams{Rate: opts.Rate, Volume: opts.Volume, Pitch: opts.Pitch}
+	}
+	switch {
+	case strings.HasPrefix(opts.OutputFormat, "raw-") || strings.HasSuffix(opts.OutputFormat, "-pcm"):
+		request.OutputFormat = tts.AudioFormatPCM
+	case strings.HasPrefix(opts.OutputFormat, "riff-"):
+		request.OutputFormat = tts.AudioFormatWAV
+	case strings.HasSuffix(opts.OutputFormat, "-mp3"):
+		request.OutputFormat = tts.AudioFormatMP3
+	}
+	return request
+}
+
+func TestProviderCapabilities_ExposeUnifiedContractConstraints(t *testing.T) {
+	provider := New()
+	caps := provider.Capabilities()
+
+	if caps.RawSSML {
+		t.Fatal("Capabilities().RawSSML = true, want false for free EdgeTTS")
+	}
+	if !caps.ProsodyParams {
+		t.Fatal("Capabilities().ProsodyParams = false, want true")
+	}
+	if !caps.BoundaryEvents {
+		t.Fatal("Capabilities().BoundaryEvents = false, want true")
+	}
+	if !caps.Streaming {
+		t.Fatal("Capabilities().Streaming = false, want true")
+	}
+	if caps.PlainTextOnly {
+		t.Fatal("Capabilities().PlainTextOnly = true, want false")
+	}
+	if caps.ResolvedOutputFormat("") != tts.AudioFormatMP3 {
+		t.Fatalf("Capabilities().ResolvedOutputFormat(empty) = %q, want %q", caps.ResolvedOutputFormat(""), tts.AudioFormatMP3)
+	}
+	if !caps.SupportsFormat(tts.AudioFormatMP3) {
+		t.Fatalf("Capabilities().SupportsFormat(%q) = false, want true", tts.AudioFormatMP3)
+	}
+	for _, format := range []string{tts.AudioFormatPCM, tts.AudioFormatWAV} {
+		if caps.SupportsFormat(format) {
+			t.Fatalf("Capabilities().SupportsFormat(%q) = true, want false", format)
+		}
+	}
+}
+
+func TestProviderCapabilities_PreQueryReturnsStableMatrix(t *testing.T) {
+	provider := New()
+	first := provider.Capabilities()
+	if len(first.SupportedFormats) == 0 {
+		t.Fatal("Capabilities().SupportedFormats is empty, want full matrix without synthesis")
+	}
+
+	first.SupportedFormats[0] = "mutated"
+
+	second := provider.Capabilities()
+	if second.SupportsFormat("mutated") {
+		t.Fatal("Capabilities() reused caller-mutated SupportedFormats slice")
+	}
+	if !second.SupportsFormat(tts.AudioFormatMP3) {
+		t.Fatalf("Capabilities().SupportsFormat(%q) = false after mutation, want true", tts.AudioFormatMP3)
+	}
+	for _, format := range []string{tts.AudioFormatPCM, tts.AudioFormatWAV} {
+		if second.SupportsFormat(format) {
+			t.Fatalf("Capabilities().SupportsFormat(%q) = true after mutation, want false", format)
+		}
+	}
+}
+
+func TestProviderSynthesize_RejectsRawSSML(t *testing.T) {
+	provider := New()
+	_, err := provider.Synthesize(context.Background(), tts.SynthesisRequest{
+		InputMode: tts.InputModeRawSSML,
+		SSML:      "<speak>hello</speak>",
+	})
+	if err == nil {
+		t.Fatal("expected raw SSML request to fail for free EdgeTTS")
+	}
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
+		t.Fatalf("error type = %T, want *tts.Error", err)
+	}
+	if ttsErr.Code != tts.ErrCodeUnsupportedCapability {
+		t.Fatalf("error code = %q, want %q", ttsErr.Code, tts.ErrCodeUnsupportedCapability)
+	}
+}
+
+func TestProviderSynthesize_RejectsUnsupportedCallerFacingFormats(t *testing.T) {
+	provider := New()
+
+	for _, format := range []string{tts.AudioFormatPCM, tts.AudioFormatWAV} {
+		t.Run(format, func(t *testing.T) {
+			_, err := provider.Synthesize(context.Background(), tts.SynthesisRequest{
+				InputMode:    tts.InputModePlainText,
+				Text:         "hello",
+				VoiceID:      "en-US-AvaMultilingualNeural",
+				OutputFormat: format,
+			})
+			if err == nil {
+				t.Fatalf("expected format %q to fail", format)
+			}
+
+			var ttsErr *tts.Error
+			if !errors.As(err, &ttsErr) {
+				t.Fatalf("error type = %T, want *tts.Error", err)
+			}
+			if ttsErr.Code != tts.ErrCodeUnsupportedFormat {
+				t.Fatalf("error code = %q, want %q", ttsErr.Code, tts.ErrCodeUnsupportedFormat)
+			}
+		})
+	}
+}
+
 func TestProviderSynthesize_NilOptions(t *testing.T) {
 	provider := New()
 
-	_, err := provider.Synthesize(context.Background(), nil)
+	_, err := provider.Synthesize(context.Background(), tts.SynthesisRequest{})
 	if err == nil {
 		t.Fatal("expected error for nil options")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("expected *tts.Error, got %T", err)
 	}
 	if ttsErr.Code != tts.ErrCodeInvalidInput {
@@ -122,13 +246,13 @@ func TestProviderSynthesize_NilOptions(t *testing.T) {
 func TestProviderSynthesizeStream_NilOptions(t *testing.T) {
 	provider := New()
 
-	_, err := provider.SynthesizeStream(context.Background(), nil)
+	_, err := provider.SynthesizeStream(context.Background(), tts.SynthesisRequest{})
 	if err == nil {
 		t.Fatal("expected error for nil options")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("expected *tts.Error, got %T", err)
 	}
 	if ttsErr.Code != tts.ErrCodeInvalidInput {
@@ -139,16 +263,16 @@ func TestProviderSynthesizeStream_NilOptions(t *testing.T) {
 func TestProviderSynthesize_EmptyAfterNormalization(t *testing.T) {
 	provider := New()
 
-	_, err := provider.Synthesize(context.Background(), &SynthesizeOptions{
+	_, err := provider.Synthesize(context.Background(), requestFromOptions(&synthesizeOptions{
 		Text:  " \t\n ",
 		Voice: "en-US-AvaMultilingualNeural",
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error for empty normalized text")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("expected *tts.Error, got %T", err)
 	}
 	if ttsErr.Code != tts.ErrCodeInvalidInput {
@@ -159,16 +283,16 @@ func TestProviderSynthesize_EmptyAfterNormalization(t *testing.T) {
 func TestProviderSynthesizeStream_EmptyAfterNormalization(t *testing.T) {
 	provider := New()
 
-	_, err := provider.SynthesizeStream(context.Background(), &SynthesizeOptions{
+	_, err := provider.SynthesizeStream(context.Background(), requestFromOptions(&synthesizeOptions{
 		Text:  "\n\t ",
 		Voice: "en-US-AvaMultilingualNeural",
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error for empty normalized text")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("expected *tts.Error, got %T", err)
 	}
 	if ttsErr.Code != tts.ErrCodeInvalidInput {
@@ -212,15 +336,15 @@ func TestProviderSynthesize_NilContextUsesBackground(t *testing.T) {
 	provider := New()
 	installSuccessfulSynthesisHook(t, provider)
 
-	audio, err := provider.Synthesize(nilContextForTest(), &SynthesizeOptions{
+	result, err := provider.Synthesize(nilContextForTest(), requestFromOptions(&synthesizeOptions{
 		Text:  "hello",
 		Voice: "en-US-AvaMultilingualNeural",
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Synthesize(nil, ...) error: %v", err)
 	}
-	if string(audio) != "ok" {
-		t.Fatalf("audio = %q; want %q", string(audio), "ok")
+	if string(result.Audio) != "ok" {
+		t.Fatalf("audio = %q; want %q", string(result.Audio), "ok")
 	}
 }
 
@@ -228,10 +352,10 @@ func TestProviderSynthesizeStream_NilContextUsesBackground(t *testing.T) {
 	provider := New()
 	installSuccessfulSynthesisHook(t, provider)
 
-	stream, err := provider.SynthesizeStream(nilContextForTest(), &SynthesizeOptions{
+	stream, err := provider.SynthesizeStream(nilContextForTest(), requestFromOptions(&synthesizeOptions{
 		Text:  "hello",
 		Voice: "en-US-AvaMultilingualNeural",
-	})
+	}))
 	if err != nil {
 		t.Fatalf("SynthesizeStream(nil, ...) error: %v", err)
 	}
@@ -248,7 +372,7 @@ func TestProviderSynthesizeStream_NilContextUsesBackground(t *testing.T) {
 	}
 
 	_, err = stream.Read()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("final stream.Read() error = %v; want io.EOF", err)
 	}
 }
@@ -269,12 +393,12 @@ func TestProviderIsAvailable_NilContextUsesBackground(t *testing.T) {
 
 func TestSplitPreparedText_AccountsForSSMLWrapperOverhead(t *testing.T) {
 	voice := strings.Repeat("v", 256)
-	budget := defaultMaxSSMLBytes - ssmlWrapperBytes(&SynthesizeOptions{Voice: voice, Rate: 1.25})
+	budget := defaultMaxSSMLBytes - ssmlWrapperBytes(&synthesizeOptions{Voice: voice, Rate: 1.25})
 	if budget <= 0 {
 		t.Fatalf("budget = %d; want positive", budget)
 	}
 
-	opts := &SynthesizeOptions{
+	opts := &synthesizeOptions{
 		Text:  strings.Repeat("a", budget+1),
 		Voice: voice,
 		Rate:  1.25,
@@ -315,7 +439,7 @@ func TestWithProxy_ClearResetsHTTPTransport(t *testing.T) {
 func TestWithProxy_InvalidProxyReturnsRuntimeConfigError(t *testing.T) {
 	p := New().WithProxy("://bad-proxy")
 
-	_, err := p.ListVoices(context.Background(), "")
+	_, err := p.ListVoices(context.Background(), tts.VoiceFilter{})
 	if err == nil {
 		t.Fatal("expected invalid proxy error, got nil")
 	}
@@ -366,7 +490,7 @@ func TestWithVoiceCache_ListVoicesUsesCache(t *testing.T) {
 	var fetchCount atomic.Int32
 
 	p := New()
-	p.voiceCache = tts.NewVoiceCache(func(ctx context.Context) ([]tts.Voice, error) {
+	p.voiceCache, _ = tts.NewVoiceCache(func(ctx context.Context) ([]tts.Voice, error) {
 		fetchCount.Add(1)
 		return filterAndConvertVoices(mockVoiceEntries(), ""), nil
 	})
@@ -374,7 +498,7 @@ func TestWithVoiceCache_ListVoicesUsesCache(t *testing.T) {
 	ctx := context.Background()
 
 	// First call: should trigger fetcher
-	voices, err := p.ListVoices(ctx, "")
+	voices, err := p.ListVoices(ctx, tts.VoiceFilter{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -386,7 +510,7 @@ func TestWithVoiceCache_ListVoicesUsesCache(t *testing.T) {
 	}
 
 	// Second call: should hit cache, no additional fetch
-	voices2, err := p.ListVoices(ctx, "")
+	voices2, err := p.ListVoices(ctx, tts.VoiceFilter{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -400,12 +524,12 @@ func TestWithVoiceCache_ListVoicesUsesCache(t *testing.T) {
 
 func TestWithVoiceCache_ListVoicesFiltersLocale(t *testing.T) {
 	p := New()
-	p.voiceCache = tts.NewVoiceCache(func(ctx context.Context) ([]tts.Voice, error) {
+	p.voiceCache, _ = tts.NewVoiceCache(func(ctx context.Context) ([]tts.Voice, error) {
 		return filterAndConvertVoices(mockVoiceEntries(), ""), nil
 	})
 
 	ctx := context.Background()
-	voices, err := p.ListVoices(ctx, "zh-CN")
+	voices, err := p.ListVoices(ctx, tts.VoiceFilter{Language: "zh-CN"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -487,8 +611,8 @@ func TestConnect_ForbiddenWithGenericDateStaysAuthFailed(t *testing.T) {
 		t.Fatal("connect() error = nil, want auth failure")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("connect() error type = %T, want *tts.Error", err)
 	}
 	if ttsErr.Code != tts.ErrCodeAuthFailed {
@@ -517,8 +641,8 @@ func TestConnect_ForbiddenWithMalformedClockSkewDateStaysAuthFailed(t *testing.T
 		t.Fatal("connect() error = nil, want auth failure")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("connect() error type = %T, want *tts.Error", err)
 	}
 	if ttsErr.Code != tts.ErrCodeAuthFailed {
@@ -551,8 +675,8 @@ func TestConnect_NonForbiddenHandshakeFailureClosesBodyWithoutSurfacingPayload(t
 		t.Fatal("expected non-403 handshake response body to be closed")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("connect() error type = %T, want *tts.Error", err)
 	}
 	if ttsErr.Code != tts.ErrCodeWebSocketError {
@@ -588,8 +712,8 @@ func TestConnect_ForbiddenHandshakeFailureReadsBoundedBodyPrefix(t *testing.T) {
 		t.Fatal("expected forbidden handshake response body to be closed")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("connect() error type = %T, want *tts.Error", err)
 	}
 	if ttsErr.Code != tts.ErrCodeAuthFailed {

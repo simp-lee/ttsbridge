@@ -69,7 +69,7 @@ func (a *App) registerCommand(cmd Command) {
 }
 
 func (a *App) usage() {
-	fmt.Fprintln(a.stderr, `TTSBridge - Text-to-Speech CLI Tool
+	writeLineIgnoreError(a.stderr, `TTSBridge - Text-to-Speech CLI Tool
 
 Usage:
   ttsbridge [flags]
@@ -92,7 +92,7 @@ func (a *App) Run(args []string) error {
 	a.globalFS = a.newGlobalFlagSet()
 
 	if err := a.globalFS.Parse(args); err != nil {
-		if err == flag.ErrHelp {
+		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		a.exitCode = ExitUsageError
@@ -120,8 +120,8 @@ func (a *App) Run(args []string) error {
 
 	cmd, ok := a.commands[cmdName]
 	if !ok {
-		fmt.Fprintf(a.stderr, "Error: unknown command %q\n", cmdName)
-		fmt.Fprintln(a.stderr, "Run 'ttsbridge --help' for usage.")
+		writeFormatIgnoreError(a.stderr, "Error: unknown command %q\n", cmdName)
+		writeLineIgnoreError(a.stderr, "Run 'ttsbridge --help' for usage.")
 		a.exitCode = ExitUsageError
 		return fmt.Errorf("unknown command: %s", cmdName)
 	}
@@ -142,15 +142,15 @@ func (a *App) handleError(err error) {
 	if errors.As(err, &usageErr) {
 		if usageErr.Message != "" && usageErr.Err != nil {
 			if usageErr.Message == usageErr.Err.Error() {
-				fmt.Fprintf(a.stderr, "Error: %s\n", usageErr.Message)
+				writeFormatIgnoreError(a.stderr, "Error: %s\n", usageErr.Message)
 				a.exitCode = ExitUsageError
 				return
 			}
-			fmt.Fprintf(a.stderr, "Error: %s: %v\n", usageErr.Message, usageErr.Err)
+			writeFormatIgnoreError(a.stderr, "Error: %s: %v\n", usageErr.Message, usageErr.Err)
 		} else if usageErr.Message != "" {
-			fmt.Fprintf(a.stderr, "Error: %s\n", usageErr.Message)
+			writeFormatIgnoreError(a.stderr, "Error: %s\n", usageErr.Message)
 		} else if usageErr.Err != nil {
-			fmt.Fprintf(a.stderr, "Error: %v\n", usageErr.Err)
+			writeFormatIgnoreError(a.stderr, "Error: %v\n", usageErr.Err)
 		}
 		a.exitCode = ExitUsageError
 		return
@@ -158,28 +158,28 @@ func (a *App) handleError(err error) {
 
 	if errors.As(err, &runtimeErr) {
 		if runtimeErr.Message != "" && runtimeErr.Err != nil {
-			fmt.Fprintf(a.stderr, "Error: %s: %v\n", runtimeErr.Message, runtimeErr.Err)
+			writeFormatIgnoreError(a.stderr, "Error: %s: %v\n", runtimeErr.Message, runtimeErr.Err)
 		} else if runtimeErr.Message != "" {
-			fmt.Fprintf(a.stderr, "Error: %s\n", runtimeErr.Message)
+			writeFormatIgnoreError(a.stderr, "Error: %s\n", runtimeErr.Message)
 		} else if runtimeErr.Err != nil {
-			fmt.Fprintf(a.stderr, "Error: %v\n", runtimeErr.Err)
+			writeFormatIgnoreError(a.stderr, "Error: %v\n", runtimeErr.Err)
 		}
 		a.exitCode = ExitRuntimeError
 		return
 	}
 
 	// Generic error
-	fmt.Fprintf(a.stderr, "Error: %v\n", err)
+	writeFormatIgnoreError(a.stderr, "Error: %v\n", err)
 	a.exitCode = ExitRuntimeError
 }
 
 func (a *App) printVersion() {
-	fmt.Fprintf(a.stdout, "ttsbridge %s\n", a.version)
+	writeFormatIgnoreError(a.stdout, "ttsbridge %s\n", a.version)
 	if a.commit != "none" && a.commit != "" {
-		fmt.Fprintf(a.stdout, "  commit: %s\n", a.commit)
+		writeFormatIgnoreError(a.stdout, "  commit: %s\n", a.commit)
 	}
 	if a.date != "unknown" && a.date != "" {
-		fmt.Fprintf(a.stdout, "  built:  %s\n", a.date)
+		writeFormatIgnoreError(a.stdout, "  built:  %s\n", a.date)
 	}
 }
 

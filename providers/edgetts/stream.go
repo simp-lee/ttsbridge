@@ -20,7 +20,7 @@ type edgeAudioStream struct {
 	conn              *websocket.Conn
 	ctx               context.Context
 	closed            bool
-	opts              *SynthesizeOptions
+	opts              *synthesizeOptions
 	provider          *Provider
 	textChunks        []string
 	chunkIndex        int
@@ -37,86 +37,128 @@ func (s *edgeAudioStream) resetConnection() {
 	}
 }
 
+type streamChunkProgress struct {
+	chunkIndex        int
+	chunkBytesEmitted int
+	boundaryEmitted   bool
+}
+
+func (s *edgeAudioStream) snapshotChunkProgress() streamChunkProgress {
+	return streamChunkProgress{
+		chunkIndex:        s.chunkIndex,
+		chunkBytesEmitted: s.chunkBytesEmitted,
+		boundaryEmitted:   s.boundaryEmitted,
+	}
+}
+
+func (s *edgeAudioStream) restoreChunkProgress(progress streamChunkProgress) {
+	s.chunkIndex = progress.chunkIndex
+	s.chunkBytesEmitted = progress.chunkBytesEmitted
+	s.boundaryEmitted = progress.boundaryEmitted
+}
+
 func (s *edgeAudioStream) nextAudioChunk(receiveTimeout time.Duration) ([]byte, error) {
-	// Capture current state for potential retry
-	currentChunkIndex := s.chunkIndex
-	currentChunkBytesEmitted := s.chunkBytesEmitted
-	currentBoundaryEmitted := s.boundaryEmitted
+	progress := s.snapshotChunkProgress()
+	return retry.DoWithResult(func() ([]byte, error) {
+		s.restoreChunkProgress(progress)
 
-	result, err := retry.DoWithResult(func() ([]byte, error) {
-		// Restore state in case of retry
-		s.chunkIndex = currentChunkIndex
-		s.chunkBytesEmitted = currentChunkBytesEmitted
-		s.boundaryEmitted = currentBoundaryEmitted
-
-		// Check if all chunks are processed
-		if s.chunkIndex >= len(s.textChunks) {
-			return nil, io.EOF
+		if err := s.prepareCurrentChunk(); err != nil {
+			return nil, err
 		}
 
-		// Initialize connection for current chunk if needed
-		if s.conn == nil {
-			if err := s.initializeChunk(); err != nil {
-				return nil, err
-			}
-		}
-
-		for {
-			select {
-			case <-s.ctx.Done():
-				return nil, s.ctx.Err()
-			default:
-			}
-
-			readCtx, readCancel := context.WithTimeout(s.ctx, receiveTimeout)
-			messageType, message, err := s.conn.Read(readCtx)
-			readCancel()
-			if err != nil {
-				readErr := s.handleReadError(err, receiveTimeout)
-				s.resetConnection()
-				return nil, readErr
-			}
-
-			switch messageType {
-			case websocket.MessageBinary:
-				if audioChunk := extractAudioData(message); len(audioChunk) > 0 {
-					s.chunkBytesEmitted += len(audioChunk)
-					return audioChunk, nil
-				}
-			case websocket.MessageText:
-				msgStr := string(message)
-
-				if s.opts.BoundaryCallback != nil && strings.Contains(msgStr, "Path:audio.metadata") {
-					if s.provider.parseAndCallbackMetadata(message, s.opts.BoundaryCallback, s.chunkIndex) {
-						s.boundaryEmitted = true
-					}
-				}
-
-				if strings.Contains(msgStr, "Path:turn.end") {
-					if s.chunkBytesEmitted == 0 {
-						s.resetConnection()
-						if s.boundaryEmitted {
-							return nil, boundaryEmissionConflictError(nil)
-						}
-						return nil, noAudioReceivedError()
-					}
-					s.resetConnection()
-					// Commit chunk progress before any retryable work for the next chunk.
-					s.chunkIndex++
-					s.chunkBytesEmitted = 0
-					s.boundaryEmitted = false
-
-					if s.chunkIndex >= len(s.textChunks) {
-						return nil, io.EOF
-					}
-
-					return nil, errChunkCommitted
-				}
-			}
-		}
+		return s.readChunkLoop(receiveTimeout)
 	}, tts.RetryOptions(s.ctx, s.provider.maxAttempts)...)
+}
 
-	return result, err
+func (s *edgeAudioStream) prepareCurrentChunk() error {
+	if s.chunkIndex >= len(s.textChunks) {
+		return io.EOF
+	}
+	if s.conn != nil {
+		return nil
+	}
+	return s.initializeChunk()
+}
+
+func (s *edgeAudioStream) readChunkLoop(receiveTimeout time.Duration) ([]byte, error) {
+	for {
+		if err := s.ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		messageType, message, err := readMessageWithTimeout(s.ctx, s.conn, receiveTimeout)
+		if err != nil {
+			return s.failChunkRead(err, receiveTimeout)
+		}
+
+		audioChunk, err := s.handleChunkMessage(messageType, message)
+		if audioChunk != nil || err != nil {
+			return audioChunk, err
+		}
+	}
+}
+
+func (s *edgeAudioStream) failChunkRead(err error, receiveTimeout time.Duration) ([]byte, error) {
+	readErr := s.handleReadError(err, receiveTimeout)
+	s.resetConnection()
+	return nil, readErr
+}
+
+func (s *edgeAudioStream) handleChunkMessage(messageType websocket.MessageType, message []byte) ([]byte, error) {
+	switch messageType {
+	case websocket.MessageBinary:
+		return s.handleBinaryChunkMessage(message), nil
+	case websocket.MessageText:
+		return nil, s.handleTextChunkMessage(message)
+	default:
+		return nil, nil
+	}
+}
+
+func (s *edgeAudioStream) handleBinaryChunkMessage(message []byte) []byte {
+	audioChunk := extractAudioData(message)
+	if len(audioChunk) == 0 {
+		return nil
+	}
+
+	s.chunkBytesEmitted += len(audioChunk)
+	return audioChunk
+}
+
+func (s *edgeAudioStream) handleTextChunkMessage(message []byte) error {
+	msgStr := string(message)
+	s.maybeEmitBoundary(message, msgStr)
+	if !strings.Contains(msgStr, "Path:turn.end") {
+		return nil
+	}
+	return s.finishCurrentChunk()
+}
+
+func (s *edgeAudioStream) maybeEmitBoundary(message []byte, msgStr string) {
+	if s.opts.BoundaryCallback != nil && strings.Contains(msgStr, "Path:audio.metadata") {
+		if s.provider.parseAndCallbackMetadata(message, s.opts.BoundaryCallback, s.chunkIndex) {
+			s.boundaryEmitted = true
+		}
+	}
+}
+
+func (s *edgeAudioStream) finishCurrentChunk() error {
+	if s.chunkBytesEmitted == 0 {
+		s.resetConnection()
+		if s.boundaryEmitted {
+			return boundaryEmissionConflictError(nil)
+		}
+		return noAudioReceivedError()
+	}
+
+	s.resetConnection()
+	s.chunkIndex++
+	s.chunkBytesEmitted = 0
+	s.boundaryEmitted = false
+	if s.chunkIndex >= len(s.textChunks) {
+		return io.EOF
+	}
+	return errChunkCommitted
 }
 
 func (s *edgeAudioStream) handleReadError(err error, receiveTimeout time.Duration) error {

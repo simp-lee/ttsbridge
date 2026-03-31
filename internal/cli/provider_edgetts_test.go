@@ -4,20 +4,32 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/simp-lee/ttsbridge/providers/edgetts"
 )
 
-func TestNewEdgeTTSAdapter_HTTPTimeoutAlsoSetsReceiveTimeout(t *testing.T) {
-	adapter, err := newEdgeTTSAdapter(&ProviderConfig{HTTPTimeout: 5 * time.Second})
+func TestNewEdgeTTSProvider_HTTPTimeoutAlsoSetsAllTimeouts(t *testing.T) {
+	provider, err := newEdgeTTSProvider(&ProviderConfig{HTTPTimeout: 5 * time.Second})
 	if err != nil {
-		t.Fatalf("newEdgeTTSAdapter() error: %v", err)
+		t.Fatalf("newEdgeTTSProvider() error: %v", err)
 	}
 
-	edgeAdapter, ok := adapter.(*edgeTTSAdapter)
+	edgeProvider, ok := provider.(*edgetts.Provider)
 	if !ok {
-		t.Fatalf("adapter type = %T, want *edgeTTSAdapter", adapter)
+		t.Fatalf("provider type = %T, want *edgetts.Provider", provider)
 	}
 
-	providerValue := reflect.ValueOf(edgeAdapter.provider).Elem()
+	providerValue := reflect.ValueOf(edgeProvider).Elem()
+	clientField := providerValue.FieldByName("client")
+	if clientField.IsNil() {
+		t.Fatal("client is nil, want initialized HTTP client")
+	}
+
+	httpTimeout := time.Duration(clientField.Elem().FieldByName("Timeout").Int())
+	if httpTimeout != 5*time.Second {
+		t.Fatalf("client.Timeout = %v, want %v", httpTimeout, 5*time.Second)
+	}
+
 	receiveTimeout := time.Duration(providerValue.FieldByName("receiveTimeout").Int())
 	if receiveTimeout != 5*time.Second {
 		t.Fatalf("receiveTimeout = %v, want %v", receiveTimeout, 5*time.Second)

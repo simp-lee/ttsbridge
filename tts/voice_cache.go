@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"sync"
 	"time"
 )
@@ -17,13 +16,17 @@ const (
 	defaultVoiceCacheStopWaitTime = 150 * time.Millisecond
 )
 
+// ErrNilVoiceCacheFetcher indicates that VoiceCache was constructed
+// with a nil fetcher function.
+var ErrNilVoiceCacheFetcher = errors.New("tts: VoiceCache fetcher must not be nil")
+
 // VoiceCache caches a Provider's voice list to reduce repeated API calls.
-// It fetches the full list (all locales) once and filters by locale on Get.
+// It fetches the full list once and applies VoiceFilter on Get.
 //
 // Usage:
 //
-//	cache := tts.NewVoiceCache(myFetcher, tts.WithTTL(12*time.Hour))
-//	voices, err := cache.Get(ctx, "zh-CN")
+//	cache, err := tts.NewVoiceCache(myFetcher, tts.WithTTL(12*time.Hour))
+//	voices, err := cache.Get(ctx, tts.VoiceFilter{Language: "zh-CN"})
 type VoiceCache struct {
 	mu        sync.RWMutex
 	voices    []Voice
@@ -65,9 +68,10 @@ func WithBackgroundRefresh(interval time.Duration) VoiceCacheOption {
 
 // NewVoiceCache creates a VoiceCache with the given fetcher and options.
 // The fetcher should return the full voice list (all locales).
-func NewVoiceCache(fetcher func(ctx context.Context) ([]Voice, error), opts ...VoiceCacheOption) *VoiceCache {
+// Returns ErrNilVoiceCacheFetcher if fetcher is nil.
+func NewVoiceCache(fetcher func(ctx context.Context) ([]Voice, error), opts ...VoiceCacheOption) (*VoiceCache, error) {
 	if fetcher == nil {
-		panic("tts: VoiceCache fetcher must not be nil")
+		return nil, ErrNilVoiceCacheFetcher
 	}
 
 	c := &VoiceCache{
@@ -80,25 +84,29 @@ func NewVoiceCache(fetcher func(ctx context.Context) ([]Voice, error), opts ...V
 		opt(c)
 	}
 	if c.bgInterval > 0 {
+		//nolint:gosec // VoiceCache stores the cancel func and invokes it from Stop to end background refresh.
 		ctx, cancel := context.WithCancel(context.Background())
 		c.cancel = cancel
 		c.done = make(chan struct{})
 		go c.startBackgroundRefresh(ctx, c.bgInterval)
 	}
-	return c
+	return c, nil
 }
 
-// Get returns the cached voice list, filtered by locale.
-// An empty locale returns all voices.
+// Get returns the cached voice list filtered by the caller's filter.
 //
 // Behavior on fetch failure:
 //   - If stale data exists, returns stale data with nil error (stale-while-revalidate).
 //   - If no data exists, returns the fetch error.
-func (c *VoiceCache) Get(ctx context.Context, locale string) ([]Voice, error) {
+func (c *VoiceCache) Get(ctx context.Context, filter VoiceFilter) ([]Voice, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Fast path: RLock check
 	c.mu.RLock()
 	if c.isValid() {
-		voices := c.filterByLocale(locale)
+		voices := c.filterVoices(filter)
 		c.mu.RUnlock()
 		return voices, nil
 	}
@@ -109,7 +117,7 @@ func (c *VoiceCache) Get(ctx context.Context, locale string) ([]Voice, error) {
 	defer c.mu.Unlock()
 
 	if c.isValid() {
-		return c.filterByLocale(locale), nil
+		return c.filterVoices(filter), nil
 	}
 
 	// Fetch new data
@@ -117,7 +125,7 @@ func (c *VoiceCache) Get(ctx context.Context, locale string) ([]Voice, error) {
 	if err != nil {
 		// Stale-while-revalidate: return stale data if available
 		if c.hasData {
-			return c.filterByLocale(locale), nil
+			return c.filterVoices(filter), nil
 		}
 		return nil, err
 	}
@@ -125,7 +133,7 @@ func (c *VoiceCache) Get(ctx context.Context, locale string) ([]Voice, error) {
 	c.voices = cloneVoices(voices)
 	c.hasData = true
 	c.fetchedAt = time.Now()
-	return c.filterByLocale(locale), nil
+	return c.filterVoices(filter), nil
 }
 
 // Stop terminates the background refresh goroutine, if any.
@@ -157,25 +165,9 @@ func (c *VoiceCache) isValid() bool {
 	return time.Since(c.fetchedAt) < c.ttl
 }
 
-// filterByLocale returns voices matching the locale.
-// Empty locale returns all voices.
-// Matches against Voice.Language and Voice.Languages using case-insensitive prefix matching.
+// filterVoices applies the caller's voice filter to the cached inventory.
 // Caller must hold at least RLock.
-func (c *VoiceCache) filterByLocale(locale string) []Voice {
-	if locale == "" {
-		return cloneVoices(c.voices)
-	}
-
-	trimmedLocale := strings.ToLower(strings.TrimSpace(locale))
-	var result []Voice
-	for i := range c.voices {
-		v := &c.voices[i]
-		if voiceMatchesLocale(v, trimmedLocale) {
-			result = append(result, cloneVoice(*v))
-		}
-	}
-	return result
-}
+func (c *VoiceCache) filterVoices(filter VoiceFilter) []Voice { return FilterVoices(c.voices, filter) }
 
 // FindCached looks up a voice by ID from the cache without triggering a fetch.
 // Returns the voice and true if found, or a zero Voice and false if the cache
@@ -219,13 +211,6 @@ func (c *VoiceCache) startBackgroundRefresh(ctx context.Context, interval time.D
 	}
 }
 
-func voiceMatchesLocale(v *Voice, locale string) bool {
-	if locale == "" {
-		return true
-	}
-	return v.SupportsLanguage(locale)
-}
-
 func cloneVoices(voices []Voice) []Voice {
 	if len(voices) == 0 {
 		return nil
@@ -255,55 +240,83 @@ func deepCopyValue(value reflect.Value) reflect.Value {
 
 	switch value.Kind() {
 	case reflect.Pointer:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		copyPtr := reflect.New(value.Type().Elem())
-		copyPtr.Elem().Set(deepCopyValue(value.Elem()))
-		return copyPtr
+		return deepCopyPointer(value)
 	case reflect.Interface:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		copyElem := deepCopyValue(value.Elem())
-		copyIface := reflect.New(value.Type()).Elem()
-		copyIface.Set(copyElem)
-		return copyIface
+		return deepCopyInterface(value)
 	case reflect.Slice:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		copySlice := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
-		for i := 0; i < value.Len(); i++ {
-			copySlice.Index(i).Set(deepCopyValue(value.Index(i)))
-		}
-		return copySlice
+		return deepCopySlice(value)
 	case reflect.Array:
-		copyArray := reflect.New(value.Type()).Elem()
-		for i := 0; i < value.Len(); i++ {
-			copyArray.Index(i).Set(deepCopyValue(value.Index(i)))
-		}
-		return copyArray
+		return deepCopyArray(value)
 	case reflect.Map:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		copyMap := reflect.MakeMapWithSize(value.Type(), value.Len())
-		for _, key := range value.MapKeys() {
-			copyMap.SetMapIndex(deepCopyValue(key), deepCopyValue(value.MapIndex(key)))
-		}
-		return copyMap
+		return deepCopyMap(value)
 	case reflect.Struct:
-		copyStruct := reflect.New(value.Type()).Elem()
-		copyStruct.Set(value)
-		for i := 0; i < value.NumField(); i++ {
-			if !copyStruct.Field(i).CanSet() {
-				continue
-			}
-			copyStruct.Field(i).Set(deepCopyValue(value.Field(i)))
-		}
-		return copyStruct
+		return deepCopyStruct(value)
 	default:
 		return value
 	}
+}
+
+func deepCopyPointer(value reflect.Value) reflect.Value {
+	if value.IsNil() {
+		return reflect.Zero(value.Type())
+	}
+
+	copyPtr := reflect.New(value.Type().Elem())
+	copyPtr.Elem().Set(deepCopyValue(value.Elem()))
+	return copyPtr
+}
+
+func deepCopyInterface(value reflect.Value) reflect.Value {
+	if value.IsNil() {
+		return reflect.Zero(value.Type())
+	}
+
+	copyElem := deepCopyValue(value.Elem())
+	copyIface := reflect.New(value.Type()).Elem()
+	copyIface.Set(copyElem)
+	return copyIface
+}
+
+func deepCopySlice(value reflect.Value) reflect.Value {
+	if value.IsNil() {
+		return reflect.Zero(value.Type())
+	}
+
+	copySlice := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+	for i := 0; i < value.Len(); i++ {
+		copySlice.Index(i).Set(deepCopyValue(value.Index(i)))
+	}
+	return copySlice
+}
+
+func deepCopyArray(value reflect.Value) reflect.Value {
+	copyArray := reflect.New(value.Type()).Elem()
+	for i := 0; i < value.Len(); i++ {
+		copyArray.Index(i).Set(deepCopyValue(value.Index(i)))
+	}
+	return copyArray
+}
+
+func deepCopyMap(value reflect.Value) reflect.Value {
+	if value.IsNil() {
+		return reflect.Zero(value.Type())
+	}
+
+	copyMap := reflect.MakeMapWithSize(value.Type(), value.Len())
+	for _, key := range value.MapKeys() {
+		copyMap.SetMapIndex(deepCopyValue(key), deepCopyValue(value.MapIndex(key)))
+	}
+	return copyMap
+}
+
+func deepCopyStruct(value reflect.Value) reflect.Value {
+	copyStruct := reflect.New(value.Type()).Elem()
+	copyStruct.Set(value)
+	for i := 0; i < value.NumField(); i++ {
+		if !copyStruct.Field(i).CanSet() {
+			continue
+		}
+		copyStruct.Field(i).Set(deepCopyValue(value.Field(i)))
+	}
+	return copyStruct
 }

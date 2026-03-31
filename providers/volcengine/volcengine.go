@@ -20,14 +20,15 @@ import (
 )
 
 const (
-	providerName        = "volcengine"
-	defaultAPIURL       = "https://translate.volcengine.com/crx/tts/v1/" // 备用地址：https://translate.volcengine.com/web/tts/v1
-	defaultMaxTextBytes = 1024
-	defaultUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	providerName         = "volcengine"
+	defaultAPIURL        = "https://translate.volcengine.com/crx/tts/v1/" // 备用地址：https://translate.volcengine.com/web/tts/v1
+	defaultMaxTextBytes  = 1024
+	defaultUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	maxResponseBodyBytes = 10 << 20 // 10 MB limit for HTTP response body
 )
 
-// SynthesizeOptions Volcengine 专属合成选项
-type SynthesizeOptions struct {
+// synthesizeOptions stores provider-native Volcengine request fields.
+type synthesizeOptions struct {
 	Text  string
 	Voice string
 
@@ -48,7 +49,7 @@ type Provider struct {
 	proxyErr         error
 }
 
-var _ tts.Provider[*SynthesizeOptions] = (*Provider)(nil)
+var _ tts.Provider = (*Provider)(nil)
 
 type translateRequest struct {
 	Text    string `json:"text"`
@@ -168,8 +169,7 @@ func (p *Provider) SupportedFormats() []tts.OutputFormat {
 	return p.FormatRegistry().Available()
 }
 
-// Synthesize 同步合成语音
-func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]byte, error) {
+func (p *Provider) synthesizeOptions(ctx context.Context, opts *synthesizeOptions) ([]byte, error) {
 	if opts == nil || opts.Text == "" {
 		return nil, &tts.Error{Code: tts.ErrCodeInvalidInput, Message: "text cannot be empty", Provider: providerName}
 	}
@@ -186,6 +186,19 @@ func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]b
 		return nil, err
 	}
 	return voiceAudio, nil
+}
+
+// Synthesize 同步合成语音
+func (p *Provider) Synthesize(ctx context.Context, request tts.SynthesisRequest) (*tts.SynthesisResult, error) {
+	opts, voiceID, err := p.buildRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	audio, err := p.synthesizeOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return buildResult(audio, voiceID)
 }
 
 func normalizeVolcengineContext(ctx context.Context) context.Context {
@@ -210,14 +223,14 @@ func splitSynthesisChunks(text string, split func(string) []string) ([]string, e
 	return chunks, nil
 }
 
-func (p *Provider) synthesizeChunks(ctx context.Context, opts *SynthesizeOptions, chunks []string) ([]byte, error) {
+func (p *Provider) synthesizeChunks(ctx context.Context, opts *synthesizeOptions, chunks []string) ([]byte, error) {
 	if len(chunks) == 1 {
 		return p.synthesizeSingleChunk(ctx, opts, chunks[0])
 	}
 	return p.synthesizeMultipleChunks(ctx, opts, chunks)
 }
 
-func (p *Provider) synthesizeSingleChunk(ctx context.Context, opts *SynthesizeOptions, chunk string) ([]byte, error) {
+func (p *Provider) synthesizeSingleChunk(ctx context.Context, opts *synthesizeOptions, chunk string) ([]byte, error) {
 	chunkOpts := *opts
 	chunkOpts.Text = chunk
 	audioData, _, err := p.synthesizeChunkWithWAVValidation(ctx, &chunkOpts, 0, false)
@@ -230,7 +243,7 @@ func (p *Provider) synthesizeSingleChunk(ctx context.Context, opts *SynthesizeOp
 	return audioData, nil
 }
 
-func (p *Provider) synthesizeMultipleChunks(ctx context.Context, opts *SynthesizeOptions, chunks []string) ([]byte, error) {
+func (p *Provider) synthesizeMultipleChunks(ctx context.Context, opts *synthesizeOptions, chunks []string) ([]byte, error) {
 	var pcmData bytes.Buffer
 	var firstHeader []byte
 	var firstProfile wavChunkProfile
@@ -260,7 +273,11 @@ func (p *Provider) synthesizeMultipleChunks(ctx context.Context, opts *Synthesiz
 	if firstHeader == nil {
 		return nil, &tts.Error{Code: tts.ErrCodeInternalError, Message: "no valid wav chunk header found", Provider: providerName}
 	}
-	return rebuildWAV(firstHeader, pcmData.Bytes()), nil
+	rebuilt, err := rebuildWAV(firstHeader, pcmData.Bytes())
+	if err != nil {
+		return nil, &tts.Error{Code: tts.ErrCodeInternalError, Message: "rebuilt wav exceeds format limits", Provider: providerName, Err: err}
+	}
+	return rebuilt, nil
 }
 
 func appendPCMChunk(pcmData *bytes.Buffer, firstHeader, audioChunk []byte) []byte {
@@ -268,11 +285,11 @@ func appendPCMChunk(pcmData *bytes.Buffer, firstHeader, audioChunk []byte) []byt
 		firstHeader = make([]byte, 44)
 		copy(firstHeader, audioChunk[:44])
 	}
-	pcmData.Write(audioChunk[44:])
+	_, _ = pcmData.Write(audioChunk[44:])
 	return firstHeader
 }
 
-func (p *Provider) synthesizeChunkWithWAVValidation(ctx context.Context, opts *SynthesizeOptions, chunkIndex int, hasValidChunk bool) ([]byte, wavChunkProfile, error) {
+func (p *Provider) synthesizeChunkWithWAVValidation(ctx context.Context, opts *synthesizeOptions, chunkIndex int, hasValidChunk bool) ([]byte, wavChunkProfile, error) {
 	audioChunk, err := p.synthesizeChunk(ctx, opts)
 	if err != nil {
 		return nil, wavChunkProfile{}, err
@@ -305,7 +322,7 @@ func truncateBody(body []byte) string {
 }
 
 // synthesizeChunk 合成单个文本块
-func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions) ([]byte, error) {
+func (p *Provider) synthesizeChunk(ctx context.Context, opts *synthesizeOptions) ([]byte, error) {
 	speaker := p.convertVoiceToSpeaker(opts.Voice)
 
 	reqData := translateRequest{
@@ -325,41 +342,41 @@ func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions)
 
 	var audioData []byte
 	err = retry.Do(func() error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payload))
-		if err != nil {
+		httpReq, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payload))
+		if requestErr != nil {
 			return &tts.Error{
 				Code:     tts.ErrCodeNetworkError,
 				Message:  "failed to create request",
 				Provider: providerName,
-				Err:      err,
+				Err:      requestErr,
 			}
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		req.Header.Set("User-Agent", defaultUserAgent)
-		req.Header.Set("Origin", "chrome-extension://klgfhbdadaspgppeadghjjemk")
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "application/json, text/plain, */*")
+		httpReq.Header.Set("User-Agent", defaultUserAgent)
+		httpReq.Header.Set("Origin", "chrome-extension://klgfhbdadaspgppeadghjjemk")
 
-		resp, err := p.client.Do(req)
-		if err != nil {
+		resp, doErr := p.client.Do(httpReq)
+		if doErr != nil {
 			return &tts.Error{
 				Code:     tts.ErrCodeNetworkError,
 				Message:  "failed to send request",
 				Provider: providerName,
-				Err:      err,
+				Err:      doErr,
 			}
 		}
 		defer func() {
 			_ = resp.Body.Close()
 		}()
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+		if readErr != nil {
 			return &tts.Error{
 				Code:     tts.ErrCodeNetworkError,
 				Message:  "failed to read response",
 				Provider: providerName,
-				Err:      err,
+				Err:      readErr,
 			}
 		}
 
@@ -382,12 +399,12 @@ func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions)
 		}
 
 		var apiResp translateResponse
-		if err := json.Unmarshal(body, &apiResp); err != nil {
+		if unmarshalErr := json.Unmarshal(body, &apiResp); unmarshalErr != nil {
 			return &tts.Error{
 				Code:     tts.ErrCodeInternalError,
 				Message:  fmt.Sprintf("failed to parse response: %s", truncateBody(body)),
 				Provider: providerName,
-				Err:      err,
+				Err:      unmarshalErr,
 			}
 		}
 
@@ -409,20 +426,19 @@ func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions)
 			}
 		}
 
-		data, err := base64.StdEncoding.DecodeString(apiResp.Audio.Data)
-		if err != nil {
+		data, decodeErr := base64.StdEncoding.DecodeString(apiResp.Audio.Data)
+		if decodeErr != nil {
 			return &tts.Error{
 				Code:     tts.ErrCodeInternalError,
 				Message:  "failed to decode audio data",
 				Provider: providerName,
-				Err:      err,
+				Err:      decodeErr,
 			}
 		}
 
 		audioData = data
 		return nil
 	}, tts.RetryOptions(ctx, p.maxRetryAttempts)...)
-
 	if err != nil {
 		if retry.IsRetryError(err) {
 			cause := unwrapRetryCause(err)
@@ -444,34 +460,17 @@ func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions)
 }
 
 // SynthesizeStream 流式合成语音
-func (p *Provider) SynthesizeStream(ctx context.Context, opts *SynthesizeOptions) (tts.AudioStream, error) {
-	audioData, err := p.Synthesize(ctx, opts)
-	if err != nil {
+func (p *Provider) SynthesizeStream(ctx context.Context, request tts.SynthesisRequest) (tts.AudioStream, error) {
+	if err := request.ValidateStreamAgainst(providerName, p.Capabilities()); err != nil {
 		return nil, err
 	}
 
-	return &audioStream{
-		data:   audioData,
-		offset: 0,
-	}, nil
+	return nil, &tts.Error{Code: tts.ErrCodeUnsupportedCapability, Message: "streaming synthesis is not supported by provider", Provider: providerName}
 }
 
 // ListVoices 列出可用的语音
-func (p *Provider) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
-	allVoices := GetAllVoices()
-
-	if locale == "" {
-		return allVoices, nil
-	}
-
-	filteredVoices := make([]tts.Voice, 0)
-	for _, voice := range allVoices {
-		if voice.SupportsLanguage(locale) {
-			filteredVoices = append(filteredVoices, voice)
-		}
-	}
-
-	return filteredVoices, nil
+func (p *Provider) ListVoices(ctx context.Context, filter tts.VoiceFilter) ([]tts.Voice, error) {
+	return tts.FilterVoices(GetAllVoices(), filter), nil
 }
 
 // IsAvailable 检查提供商是否可用
@@ -483,7 +482,7 @@ func (p *Provider) IsAvailable(ctx context.Context) bool {
 		return false
 	}
 
-	_, _, err := p.synthesizeChunkWithWAVValidation(ctx, &SynthesizeOptions{
+	_, _, err := p.synthesizeChunkWithWAVValidation(ctx, &synthesizeOptions{
 		Text:  "测试",
 		Voice: "BV700_streaming",
 	}, 0, false)
@@ -527,42 +526,6 @@ func (p *Provider) splitText(cleanedText string) []string {
 	})
 }
 
-// audioStream 音频流
-type audioStream struct {
-	data   []byte
-	offset int
-	closed bool
-}
-
-var _ tts.AudioStream = (*audioStream)(nil)
-
-func (s *audioStream) Read() ([]byte, error) {
-	if s.closed {
-		return nil, io.EOF
-	}
-
-	if s.offset >= len(s.data) {
-		s.closed = true
-		return nil, io.EOF
-	}
-
-	chunkSize := 4096
-	remaining := len(s.data) - s.offset
-	if remaining < chunkSize {
-		chunkSize = remaining
-	}
-
-	chunk := s.data[s.offset : s.offset+chunkSize]
-	s.offset += chunkSize
-
-	return chunk, nil
-}
-
-func (s *audioStream) Close() error {
-	s.closed = true
-	return nil
-}
-
 func (p *Provider) runtimeConfigError() error {
 	if p.baseURLErr != nil {
 		return p.baseURLErr
@@ -599,11 +562,6 @@ func unwrapRetryCause(err error) error {
 	return err
 }
 
-func isValidWAVHeader(chunk []byte) bool {
-	_, _, _, ok := parseCanonicalWAV(chunk)
-	return ok
-}
-
 type wavChunkProfile struct {
 	audioFormat   uint16
 	channels      uint16
@@ -626,17 +584,31 @@ func parseCanonicalWAV(chunk []byte) ([]byte, []byte, wavChunkProfile, bool) {
 	if len(chunk) < 44 {
 		return nil, nil, wavChunkProfile{}, false
 	}
-	if string(chunk[0:4]) != "RIFF" ||
-		string(chunk[8:12]) != "WAVE" ||
-		string(chunk[12:16]) != "fmt " ||
-		string(chunk[36:40]) != "data" {
-		return nil, nil, wavChunkProfile{}, false
-	}
-	if binary.LittleEndian.Uint32(chunk[16:20]) != 16 {
+	if !hasCanonicalWAVSignature(chunk) || !hasPCMFormatChunk(chunk) {
 		return nil, nil, wavChunkProfile{}, false
 	}
 
-	profile := wavChunkProfile{
+	profile := readWAVChunkProfile(chunk)
+	if !isValidWAVChunkProfile(profile) || !hasValidWAVChunkData(chunk, profile) {
+		return nil, nil, wavChunkProfile{}, false
+	}
+
+	return chunk[:44], chunk[44:], profile, true
+}
+
+func hasCanonicalWAVSignature(chunk []byte) bool {
+	return string(chunk[0:4]) == "RIFF" &&
+		string(chunk[8:12]) == "WAVE" &&
+		string(chunk[12:16]) == "fmt " &&
+		string(chunk[36:40]) == "data"
+}
+
+func hasPCMFormatChunk(chunk []byte) bool {
+	return binary.LittleEndian.Uint32(chunk[16:20]) == 16
+}
+
+func readWAVChunkProfile(chunk []byte) wavChunkProfile {
+	return wavChunkProfile{
 		audioFormat:   binary.LittleEndian.Uint16(chunk[20:22]),
 		channels:      binary.LittleEndian.Uint16(chunk[22:24]),
 		sampleRate:    binary.LittleEndian.Uint32(chunk[24:28]),
@@ -644,43 +616,48 @@ func parseCanonicalWAV(chunk []byte) ([]byte, []byte, wavChunkProfile, bool) {
 		blockAlign:    binary.LittleEndian.Uint16(chunk[32:34]),
 		bitsPerSample: binary.LittleEndian.Uint16(chunk[34:36]),
 	}
-	if profile.audioFormat != 1 || profile.channels == 0 || profile.sampleRate == 0 || profile.bitsPerSample == 0 || profile.bitsPerSample%8 != 0 {
-		return nil, nil, wavChunkProfile{}, false
-	}
-
-	expectedBlockAlign := uint16(uint32(profile.channels) * uint32(profile.bitsPerSample) / 8)
-	if expectedBlockAlign == 0 || profile.blockAlign != expectedBlockAlign {
-		return nil, nil, wavChunkProfile{}, false
-	}
-	if profile.byteRate != profile.sampleRate*uint32(profile.blockAlign) {
-		return nil, nil, wavChunkProfile{}, false
-	}
-
-	riffSize := binary.LittleEndian.Uint32(chunk[4:8])
-	dataSize := binary.LittleEndian.Uint32(chunk[40:44])
-	actualDataSize := len(chunk) - 44
-
-	if dataSize == 0 || actualDataSize <= 0 {
-		return nil, nil, wavChunkProfile{}, false
-	}
-	if riffSize != uint32(len(chunk)-8) {
-		return nil, nil, wavChunkProfile{}, false
-	}
-	if dataSize != uint32(actualDataSize) {
-		return nil, nil, wavChunkProfile{}, false
-	}
-	if actualDataSize%int(profile.blockAlign) != 0 {
-		return nil, nil, wavChunkProfile{}, false
-	}
-
-	return chunk[:44], chunk[44:], profile, true
 }
 
-// rebuildWAV 重建 WAV 文件，更新 header 中的数据大小
-func rebuildWAV(header []byte, pcmData []byte) []byte {
+func isValidWAVChunkProfile(profile wavChunkProfile) bool {
+	if profile.audioFormat != 1 || profile.channels == 0 || profile.sampleRate == 0 || profile.bitsPerSample == 0 || profile.bitsPerSample%8 != 0 {
+		return false
+	}
+
+	expectedBlockAlign64 := uint64(profile.channels) * uint64(profile.bitsPerSample) / 8
+	if expectedBlockAlign64 == 0 || expectedBlockAlign64 > tts.MaxWAVUint16 {
+		return false
+	}
+	expectedBlockAlign := uint16(expectedBlockAlign64)
+	if expectedBlockAlign == 0 || profile.blockAlign != expectedBlockAlign {
+		return false
+	}
+	return profile.byteRate == profile.sampleRate*uint32(profile.blockAlign)
+}
+
+func hasValidWAVChunkData(chunk []byte, profile wavChunkProfile) bool {
+	riffSize := binary.LittleEndian.Uint32(chunk[4:8])
+	dataSize := binary.LittleEndian.Uint32(chunk[40:44])
+	chunkSize := uint64(len(chunk))
+	actualDataSize := chunkSize - 44
+	expectedRiffSize := chunkSize - 8
+
+	if dataSize == 0 || actualDataSize == 0 {
+		return false
+	}
+	if expectedRiffSize > tts.MaxWAVUint32 || actualDataSize > tts.MaxWAVUint32 {
+		return false
+	}
+	if riffSize != uint32(expectedRiffSize) || dataSize != uint32(actualDataSize) {
+		return false
+	}
+	return actualDataSize%uint64(profile.blockAlign) == 0
+}
+
+// rebuildWAV 重建 WAV 文件，更新 header 中的数据大小。
+func rebuildWAV(header []byte, pcmData []byte) ([]byte, error) {
 	if len(header) < 44 {
 		// header 不完整，直接返回 PCM 数据
-		return pcmData
+		return pcmData, nil
 	}
 
 	// 复制 header
@@ -688,25 +665,23 @@ func rebuildWAV(header []byte, pcmData []byte) []byte {
 	copy(newHeader, header)
 
 	// 计算新的文件大小
-	dataSize := len(pcmData)
+	dataSize := uint64(len(pcmData))
+	if dataSize+36 > tts.MaxWAVUint32 {
+		return nil, fmt.Errorf("wav data exceeds size limit")
+	}
 	fileSize := dataSize + 36 // 不含 RIFF header 的 8 字节
 
 	// 更新 RIFF chunk size (字节 4-7)
-	newHeader[4] = byte(fileSize & 0xff)
-	newHeader[5] = byte((fileSize >> 8) & 0xff)
-	newHeader[6] = byte((fileSize >> 16) & 0xff)
-	newHeader[7] = byte((fileSize >> 24) & 0xff)
+	fileSize32 := uint32(fileSize)
+	binary.LittleEndian.PutUint32(newHeader[4:8], fileSize32)
 
 	// 更新 data chunk size (字节 40-43)
-	newHeader[40] = byte(dataSize & 0xff)
-	newHeader[41] = byte((dataSize >> 8) & 0xff)
-	newHeader[42] = byte((dataSize >> 16) & 0xff)
-	newHeader[43] = byte((dataSize >> 24) & 0xff)
+	binary.LittleEndian.PutUint32(newHeader[40:44], fileSize32-36)
 
 	// 拼接 header 和 PCM 数据
-	result := make([]byte, 0, 44+dataSize)
+	result := make([]byte, 0, 44+len(pcmData))
 	result = append(result, newHeader...)
 	result = append(result, pcmData...)
 
-	return result
+	return result, nil
 }

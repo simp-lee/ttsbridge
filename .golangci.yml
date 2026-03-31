@@ -1,0 +1,131 @@
+# .golangci.yml -- project-level unified rules for golangci-lint v2
+version: "2"
+
+run:
+  timeout: 5m
+  relative-path-mode: gomod
+  modules-download-mode: readonly
+  allow-parallel-runners: true
+  allow-serial-runners: true
+
+linters:
+  default: none
+  enable:
+    # Start from a low-noise baseline and add stricter complexity/style rules later.
+    - errcheck
+    - errorlint
+    - gosec
+    - sqlclosecheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - unconvert
+    - bodyclose
+    - durationcheck
+    - noctx
+    - nolintlint
+    # Repository boundary regressions are enforced by `make arch`, which runs
+    # focused repository-acceptance tests. Uncomment depguard only if you also
+    # want matching lint-time import rules and keep the template below in sync.
+    # - depguard
+
+    # Optional follow-up set once the repository is ready for broader policy
+    # and style enforcement:
+    # - wrapcheck
+    # - revive
+    # - unparam
+
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*database/sql.Rows).Close
+
+    errorlint:
+      errorf: true
+
+    govet:
+      enable:
+        - shadow
+
+    gosec:
+      excludes:
+        - G104
+
+    # Optional lint-time mirror of the import boundaries enforced by `make arch`.
+    #
+    # Copy this block, replace the deny rules as needed, then uncomment both the
+    # depguard block and the depguard entry in linters.enable above.
+    #
+    # Matching notes:
+    # - use pkg: ".../repo$" for the exact package only
+    # - use pkg: ".../repo/" for subpackages only
+    # - keep both when you want to block repo without accidentally matching
+    #   similarly named packages such as internal/repository
+    #
+    # depguard:
+    #   rules:
+    #     cli-layer:
+    #       files:
+    #         - "${base-path}/internal/cli/**/*.go"
+    #         - "!${base-path}/internal/cli/**/*_test.go"
+    #         - "!${base-path}/internal/cli/**/*_mock.go"
+    #         - "!${base-path}/internal/cli/**/mock_*.go"
+    #       deny:
+    #         - pkg: "github.com/simp-lee/ttsbridge/providers/"
+    #           desc: "CLI composition should depend on shared abstractions or explicit wiring, not provider internals."
+    #
+    #     tts-layer:
+    #       files:
+    #         - "${base-path}/tts/**/*.go"
+    #         - "!${base-path}/tts/**/*_test.go"
+    #         - "!${base-path}/tts/**/*_mock.go"
+    #         - "!${base-path}/tts/**/mock_*.go"
+    #       deny:
+    #         - pkg: "github.com/simp-lee/ttsbridge/internal/"
+    #           desc: "Public tts packages should not depend on internal CLI wiring."
+    #
+    #     provider-layer:
+    #       files:
+    #         - "${base-path}/providers/**/*.go"
+    #         - "!${base-path}/providers/**/*_test.go"
+    #         - "!${base-path}/providers/**/*_mock.go"
+    #         - "!${base-path}/providers/**/mock_*.go"
+    #       deny:
+    #         - pkg: "github.com/simp-lee/ttsbridge/internal/"
+    #           desc: "Providers should not depend on internal CLI packages."
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+      - path: (migrations|testdata|fixtures)/
+        linters:
+          - gosec
+      - linters:
+          - staticcheck
+        text: "SA9003:"
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+      colors: true
+  sort-order:
+    - linter
+    - severity
+    - file
+  show-stats: true

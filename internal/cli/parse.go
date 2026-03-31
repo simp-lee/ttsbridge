@@ -70,7 +70,7 @@ func ParseRatePercent(s string) (float64, error) {
 }
 
 // ParseVolumePercent parses volume percentage and returns a multiplier in range [0.0, 2.0].
-// Note: We keep a multiplier (1.0 = +0%, 2.0 = +100%) and let the provider format it.
+// Note: 0.0 is a valid explicit mute value and must not be rewritten to provider default.
 func ParseVolumePercent(s string) (float64, error) {
 	value, err := ParsePercent(s)
 	if err != nil {

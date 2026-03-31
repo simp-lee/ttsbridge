@@ -239,7 +239,3 @@ func ParseOutputFormat(format string) (tts.VoiceAudioProfile, bool) {
 
 	return profile, true
 }
-
-// parseOutputFormat is an unexported alias kept for backward compatibility
-// within the package.
-var parseOutputFormat = ParseOutputFormat

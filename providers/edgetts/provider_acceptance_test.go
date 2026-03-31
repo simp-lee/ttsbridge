@@ -4,12 +4,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/simp-lee/ttsbridge/providers/volcengine"
 )
 
 // AC-3: provider 的合成选项结构必须只表达远端 TTS 请求语义，不得包含任何本地媒体处理字段。
-func TestSynthesizeOptions_DoNotExposeLocalMediaFields(t *testing.T) {
+func TestInternalRequestTranslationShape_DoNotExposeLocalMediaFields(t *testing.T) {
 	forbiddenFields := map[string]struct{}{
 		"BackgroundMusic":        {},
 		"BackgroundMusicFile":    {},
@@ -22,30 +20,27 @@ func TestSynthesizeOptions_DoNotExposeLocalMediaFields(t *testing.T) {
 	}
 	forbiddenTokens := []string{"background", "music", "mix", "ffmpeg", "ffprobe", "upload", "file", "path"}
 
-	optionsType := reflect.TypeOf(SynthesizeOptions{})
+	optionsType := reflect.TypeOf(synthesizeOptions{})
 	for i := range optionsType.NumField() {
 		field := optionsType.Field(i)
 		if _, forbidden := forbiddenFields[field.Name]; forbidden {
-			t.Fatalf("SynthesizeOptions unexpectedly exposes local media field %q", field.Name)
+			t.Fatalf("internal request translation struct unexpectedly exposes local media field %q", field.Name)
 		}
 
 		lowerName := strings.ToLower(field.Name)
 		for _, token := range forbiddenTokens {
 			if strings.Contains(lowerName, token) {
-				t.Fatalf("SynthesizeOptions field %q should not contain local media token %q", field.Name, token)
+				t.Fatalf("internal request translation field %q should not contain local media token %q", field.Name, token)
 			}
 		}
 	}
 }
 
-// AC-14: provider 差异封装在 provider 实现和专属选项中，不回流核心抽象。
-func TestProviderSpecificOptions_OnlyShareMinimalCrossProviderRequestFields(t *testing.T) {
-	sharedAllowed := map[string]struct{}{
-		"Text":             {},
-		"Voice":            {},
-		"ProgressCallback": {},
-	}
-	edgeOnlyAllowed := map[string]struct{}{
+// AC-14: provider 内部请求翻译层必须保持聚焦，不得重新长出新的本地或公共入口字段。
+func TestInternalRequestTranslationShape_RemainsFocused(t *testing.T) {
+	allowedFields := map[string]struct{}{
+		"Text":                    {},
+		"Voice":                   {},
 		"Rate":                    {},
 		"Volume":                  {},
 		"Pitch":                   {},
@@ -53,42 +48,25 @@ func TestProviderSpecificOptions_OnlyShareMinimalCrossProviderRequestFields(t *t
 		"SentenceBoundaryEnabled": {},
 		"OutputFormat":            {},
 		"BoundaryCallback":        {},
+		"ProgressCallback":        {},
 	}
 
-	edgeFields := reflect.VisibleFields(reflect.TypeOf(SynthesizeOptions{}))
-	volcFields := reflect.VisibleFields(reflect.TypeOf(volcengine.SynthesizeOptions{}))
-	volcFieldSet := make(map[string]struct{}, len(volcFields))
-	for _, field := range volcFields {
-		volcFieldSet[field.Name] = struct{}{}
+	fields := reflect.VisibleFields(reflect.TypeOf(synthesizeOptions{}))
+	if len(fields) != len(allowedFields) {
+		t.Fatalf("internal request translation field count = %d, want %d", len(fields), len(allowedFields))
 	}
 
-	sharedFields := make(map[string]struct{})
-	for _, field := range edgeFields {
-		if _, ok := volcFieldSet[field.Name]; ok {
-			sharedFields[field.Name] = struct{}{}
-			if _, allowed := sharedAllowed[field.Name]; !allowed {
-				t.Fatalf("provider option field %q is shared across providers but should stay provider-specific", field.Name)
-			}
-			continue
-		}
-		if _, allowed := edgeOnlyAllowed[field.Name]; !allowed {
-			t.Fatalf("unexpected EdgeTTS-only option field %q; update acceptance guard if this new provider-specific concept is intentional", field.Name)
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		seen[field.Name] = struct{}{}
+		if _, allowed := allowedFields[field.Name]; !allowed {
+			t.Fatalf("unexpected internal request translation field %q; update acceptance guard if this new provider-native concept is intentional", field.Name)
 		}
 	}
 
-	if len(sharedFields) != len(sharedAllowed) {
-		t.Fatalf("shared option fields = %v, want exactly %v", sharedFields, sharedAllowed)
-	}
-	for fieldName := range sharedAllowed {
-		if _, ok := sharedFields[fieldName]; !ok {
-			t.Fatalf("expected shared core request field %q to remain present across providers", fieldName)
+	for fieldName := range allowedFields {
+		if _, ok := seen[fieldName]; !ok {
+			t.Fatalf("expected internal request translation field %q to remain present", fieldName)
 		}
-	}
-
-	for _, field := range volcFields {
-		if _, ok := sharedAllowed[field.Name]; ok {
-			continue
-		}
-		t.Fatalf("unexpected Volcengine-only field %q leaked into the shared provider option shape", field.Name)
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -20,8 +21,8 @@ func main() {
 	fmt.Println("1. 基本使用")
 	basicUsage()
 
-	// 2. 使用边界事件回调获取字幕信息
-	fmt.Println("\n2. 边界事件回调演示")
+	// 2. 读取边界事件结果获取字幕信息
+	fmt.Println("\n2. 边界事件结果演示")
 	metadataDemo()
 
 	// 3. 自定义配置（代理、超时等）
@@ -41,31 +42,29 @@ func main() {
 func basicUsage() {
 	provider := edgetts.New()
 
-	opts := &edgetts.SynthesizeOptions{
-		Text:   "你好，欢迎使用 TTSBridge！",
-		Voice:  "zh-CN-XiaoxiaoNeural",
-		Rate:   1.0,
-		Volume: 1.0,
-		Pitch:  1.0,
+	request := tts.SynthesisRequest{
+		InputMode: tts.InputModePlainText,
+		Text:      "你好，欢迎使用 TTSBridge！",
+		VoiceID:   "zh-CN-XiaoxiaoNeural",
 	}
 
 	ctx := context.Background()
-	audio, err := provider.Synthesize(ctx, opts)
+	result, err := provider.Synthesize(ctx, request)
 	if err != nil {
 		log.Printf("合成失败: %v\n", err)
 		return
 	}
 
 	filename := "output_basic.mp3"
-	if err := os.WriteFile(filename, audio, 0644); err != nil {
+	if err := os.WriteFile(filename, result.Audio, 0o600); err != nil {
 		log.Printf("保存失败: %v\n", err)
 		return
 	}
 
-	fmt.Printf("✓ 合成成功，已保存到 %s (大小: %d 字节)\n", filename, len(audio))
+	fmt.Printf("✓ 合成成功，已保存到 %s (大小: %d 字节)\n", filename, len(result.Audio))
 }
 
-// metadataDemo 边界事件回调演示
+// metadataDemo 边界事件结果演示
 func metadataDemo() {
 	provider := edgetts.New()
 
@@ -77,31 +76,31 @@ func metadataDemo() {
 	}
 	var subtitles []Subtitle
 
-	opts := &edgetts.SynthesizeOptions{
-		Text:                "这是第一句话。这是第二句话。这是第三句话。",
-		Voice:               "zh-CN-XiaoxiaoNeural",
-		WordBoundaryEnabled: true, // 启用词边界
-		BoundaryCallback: func(event tts.BoundaryEvent) {
-			// 实时接收词边界信息
-			if event.Type == "WordBoundary" {
-				subtitles = append(subtitles, Subtitle{
-					Text:      event.Text,
-					StartTime: event.Offset,
-					EndTime:   event.Offset + event.Duration,
-				})
-			}
-		},
+	request := tts.SynthesisRequest{
+		InputMode:          tts.InputModePlainText,
+		Text:               "这是第一句话。这是第二句话。这是第三句话。",
+		VoiceID:            "zh-CN-XiaoxiaoNeural",
+		NeedBoundaryEvents: true,
 	}
 
 	ctx := context.Background()
-	audio, err := provider.Synthesize(ctx, opts)
+	result, err := provider.Synthesize(ctx, request)
 	if err != nil {
 		log.Printf("合成失败: %v\n", err)
 		return
 	}
+	for _, event := range result.BoundaryEvents {
+		if event.Type == tts.BoundaryTypeWord {
+			subtitles = append(subtitles, Subtitle{
+				Text:      event.Text,
+				StartTime: event.Offset,
+				EndTime:   event.Offset + event.Duration,
+			})
+		}
+	}
 
 	filename := "output_metadata.mp3"
-	if err := os.WriteFile(filename, audio, 0644); err != nil {
+	if err := os.WriteFile(filename, result.Audio, 0o600); err != nil {
 		log.Printf("保存失败: %v\n", err)
 		return
 	}
@@ -137,23 +136,24 @@ func customConfigDemo() {
 		WithMaxAttempts(3)
 	// 如果需要代理: .WithProxy("http://proxy.example.com:8080")
 
-	opts := &edgetts.SynthesizeOptions{
-		Text:   "这是使用自定义配置的示例。",
-		Voice:  "zh-CN-YunxiNeural",
-		Rate:   1.2, // 加快 20%
-		Volume: 1.0,
-		Pitch:  1.0,
+	request := tts.SynthesisRequest{
+		InputMode: tts.InputModePlainTextWithProsody,
+		Text:      "这是使用自定义配置的示例。",
+		VoiceID:   "zh-CN-YunxiNeural",
+		Prosody: tts.ProsodyParams{
+			Rate: 1.2, // 加快 20%
+		},
 	}
 
 	ctx := context.Background()
-	audio, err := provider.Synthesize(ctx, opts)
+	result, err := provider.Synthesize(ctx, request)
 	if err != nil {
 		log.Printf("合成失败: %v\n", err)
 		return
 	}
 
 	filename := "output_custom.mp3"
-	if err := os.WriteFile(filename, audio, 0644); err != nil {
+	if err := os.WriteFile(filename, result.Audio, 0o600); err != nil {
 		log.Printf("保存失败: %v\n", err)
 		return
 	}
@@ -168,7 +168,7 @@ func listVoicesDemo() {
 	ctx := context.Background()
 
 	// 获取所有中文语音
-	voices, err := provider.ListVoices(ctx, "zh-CN")
+	voices, err := provider.ListVoices(ctx, tts.VoiceFilter{Language: "zh-CN"})
 	if err != nil {
 		log.Printf("获取语音列表失败: %v\n", err)
 		return
@@ -202,17 +202,19 @@ func errorHandlingDemo() {
 	provider := edgetts.New()
 
 	// 使用错误的语音名称
-	opts := &edgetts.SynthesizeOptions{
-		Text:  "测试错误处理",
-		Voice: "invalid-voice-name",
+	request := tts.SynthesisRequest{
+		InputMode: tts.InputModePlainText,
+		Text:      "测试错误处理",
+		VoiceID:   "invalid-voice-name",
 	}
 
 	ctx := context.Background()
-	_, err := provider.Synthesize(ctx, opts)
+	_, err := provider.Synthesize(ctx, request)
 
 	if err != nil {
 		// 检查是否是 TTS 特定错误
-		if ttsErr, ok := err.(*tts.Error); ok {
+		var ttsErr *tts.Error
+		if errors.As(err, &ttsErr) {
 			fmt.Printf("✓ 捕获到 TTS 错误:\n")
 			fmt.Printf("  代码: %s\n", ttsErr.Code)
 			fmt.Printf("  消息: %s\n", ttsErr.Message)

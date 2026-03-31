@@ -1,7 +1,8 @@
 package edgetts
 
 const (
-	providerName       = "edgetts"
+	providerName = "edgetts"
+	//nolint:gosec // This is Edge's public trusted-client protocol token, not a deploy-time credential.
 	defaultClientToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
 
 	// ==== 恢复之前更旧的接口 322 个语音 ====
@@ -32,10 +33,10 @@ const (
 	// 用于构建 User-Agent 等 HTTP 头部。与 chromiumFullVersion 保持同步。
 	chromiumMajorVersion = "143"
 	// secMsGecVersion 是 Sec-MS-GEC-Version 请求头的值，格式为 "1-{chromiumFullVersion}"。
-	// 该值与 GenerateSecMsGec() 生成的 token 配对使用，参见 drm.go。
+	// 该值与 Provider.generateSecMsGec() 生成的 token 配对使用，参见 drm.go。
 	secMsGecVersion = "1-" + chromiumFullVersion
 
-	defaultOutputFormat  = "audio-24khz-48kbitrate-mono-mp3"
-	defaultMaxSSMLBytes  = 4096
-	defaultVoice         = "zh-CN-XiaoxiaoNeural" // Default voice when not specified
+	defaultOutputFormat = "audio-24khz-48kbitrate-mono-mp3"
+	defaultMaxSSMLBytes = 4096
+	defaultVoice        = "zh-CN-XiaoxiaoNeural" // Default voice when not specified
 )

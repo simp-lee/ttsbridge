@@ -14,6 +14,122 @@ import (
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
+func plainTextRequest(text, voice string) tts.SynthesisRequest {
+	return tts.SynthesisRequest{
+		InputMode: tts.InputModePlainText,
+		Text:      text,
+		VoiceID:   voice,
+	}
+}
+
+func TestProviderCapabilities_ExposeUnifiedContractConstraints(t *testing.T) {
+	provider := New()
+	caps := provider.Capabilities()
+
+	if caps.RawSSML {
+		t.Fatal("Capabilities().RawSSML = true, want false")
+	}
+	if caps.ProsodyParams {
+		t.Fatal("Capabilities().ProsodyParams = true, want false")
+	}
+	if !caps.PlainTextOnly {
+		t.Fatal("Capabilities().PlainTextOnly = false, want true")
+	}
+	if caps.BoundaryEvents {
+		t.Fatal("Capabilities().BoundaryEvents = true, want false")
+	}
+	if caps.Streaming {
+		t.Fatal("Capabilities().Streaming = true, want false")
+	}
+	if caps.ResolvedOutputFormat("") != tts.AudioFormatWAV {
+		t.Fatalf("Capabilities().ResolvedOutputFormat(empty) = %q, want %q", caps.ResolvedOutputFormat(""), tts.AudioFormatWAV)
+	}
+	if !caps.SupportsFormat(tts.AudioFormatWAV) {
+		t.Fatal("Capabilities().SupportsFormat(wav) = false, want true")
+	}
+	for _, format := range []string{tts.AudioFormatMP3, tts.AudioFormatPCM} {
+		if caps.SupportsFormat(format) {
+			t.Fatalf("Capabilities().SupportsFormat(%q) = true, want false", format)
+		}
+	}
+}
+
+func TestProviderCapabilities_PreQueryReturnsStableMatrix(t *testing.T) {
+	provider := New()
+	first := provider.Capabilities()
+	if len(first.SupportedFormats) == 0 {
+		t.Fatal("Capabilities().SupportedFormats is empty, want full matrix without synthesis")
+	}
+
+	first.SupportedFormats[0] = tts.AudioFormatMP3
+
+	second := provider.Capabilities()
+	if second.SupportsFormat(tts.AudioFormatMP3) {
+		t.Fatal("Capabilities() reused caller-mutated SupportedFormats slice")
+	}
+	if !second.SupportsFormat(tts.AudioFormatWAV) {
+		t.Fatal("Capabilities().SupportsFormat(wav) = false after mutation, want true")
+	}
+}
+
+func TestSynthesizeRejectsProsodyInputMode(t *testing.T) {
+	provider := New()
+	_, err := provider.Synthesize(context.Background(), tts.SynthesisRequest{
+		InputMode: tts.InputModePlainTextWithProsody,
+		Text:      "hello",
+		VoiceID:   "BV700_streaming",
+		Prosody:   tts.ProsodyParams{Rate: 1.1},
+	})
+	if err == nil {
+		t.Fatal("expected prosody request to fail for Volcengine")
+	}
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
+		t.Fatalf("error type = %T, want *tts.Error", err)
+	}
+	if ttsErr.Code != tts.ErrCodeUnsupportedCapability {
+		t.Fatalf("error code = %q, want %q", ttsErr.Code, tts.ErrCodeUnsupportedCapability)
+	}
+}
+
+func TestSynthesizeRejectsRawSSMLInputMode(t *testing.T) {
+	provider := New()
+	_, err := provider.Synthesize(context.Background(), tts.SynthesisRequest{
+		InputMode: tts.InputModeRawSSML,
+		SSML:      "<speak>hello</speak>",
+		VoiceID:   "BV700_streaming",
+	})
+	if err == nil {
+		t.Fatal("expected raw SSML request to fail for Volcengine")
+	}
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
+		t.Fatalf("error type = %T, want *tts.Error", err)
+	}
+	if ttsErr.Code != tts.ErrCodeUnsupportedCapability {
+		t.Fatalf("error code = %q, want %q", ttsErr.Code, tts.ErrCodeUnsupportedCapability)
+	}
+}
+
+func TestSynthesizeStreamRejectsUnsupportedStreaming(t *testing.T) {
+	provider := New()
+	_, err := provider.SynthesizeStream(context.Background(), plainTextRequest("hello", "BV700_streaming"))
+	if err == nil {
+		t.Fatal("expected stream request to fail for Volcengine")
+	}
+
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
+		t.Fatalf("error type = %T, want *tts.Error", err)
+	}
+	if ttsErr.Code != tts.ErrCodeUnsupportedCapability {
+		t.Fatalf("error code = %q, want %q", ttsErr.Code, tts.ErrCodeUnsupportedCapability)
+	}
+	if ttsErr.Message != "streaming synthesis is not supported by provider" {
+		t.Fatalf("error message = %q, want %q", ttsErr.Message, "streaming synthesis is not supported by provider")
+	}
+}
+
 func TestIsAvailableRejectsInvalidWAVResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := translateResponseStub{}
@@ -78,7 +194,7 @@ func TestSynthesizeRejectsMalformedPseudoWAV(t *testing.T) {
 			defer server.Close()
 
 			p := New().WithBaseURL(server.URL).WithMaxAttempts(1)
-			_, err := p.Synthesize(context.Background(), &SynthesizeOptions{Text: "hello", Voice: "BV700_streaming"})
+			_, err := p.Synthesize(context.Background(), plainTextRequest("hello", "BV700_streaming"))
 			if err == nil {
 				t.Fatalf("expected error for %s", tt.name)
 			}
@@ -98,7 +214,7 @@ func TestSynthesizePreservesProviderUnavailableAfterRetryExhaustion(t *testing.T
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithMaxAttempts(2)
-	_, err := p.Synthesize(context.Background(), &SynthesizeOptions{Text: "hello", Voice: "BV700_streaming"})
+	_, err := p.Synthesize(context.Background(), plainTextRequest("hello", "BV700_streaming"))
 	if err == nil {
 		t.Fatal("expected retry exhaustion error, got nil")
 	}
@@ -130,7 +246,7 @@ func TestSynthesizeFailsFastOnInvalidProxyURL(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL(server.URL).WithProxy("://bad-proxy")
-	_, err := p.Synthesize(context.Background(), &SynthesizeOptions{Text: "hello", Voice: "BV700_streaming"})
+	_, err := p.Synthesize(context.Background(), plainTextRequest("hello", "BV700_streaming"))
 	if err == nil {
 		t.Fatal("expected invalid proxy error, got nil")
 	}
@@ -183,7 +299,7 @@ func TestSynthesizeFailsFastOnInvalidBaseURL(t *testing.T) {
 	defer server.Close()
 
 	p := New().WithBaseURL("://bad-base").WithMaxAttempts(3)
-	_, err := p.Synthesize(context.Background(), &SynthesizeOptions{Text: "hello", Voice: "BV700_streaming"})
+	_, err := p.Synthesize(context.Background(), plainTextRequest("hello", "BV700_streaming"))
 	if err == nil {
 		t.Fatal("expected invalid base URL error, got nil")
 	}

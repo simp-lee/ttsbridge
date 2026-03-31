@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,85 +25,69 @@ func main() {
 	fmt.Printf("文本长度: %d 字节\n", len(longText))
 
 	// 测试同步合成（带元数据）
-	fmt.Println("\n=== 测试同步合成（带元数据回调） ===")
+	fmt.Println("\n=== 测试同步合成（读取 BoundaryEvents） ===")
 	ctx := context.Background()
 
-	var wordCount int
-	var sentenceCount int
-
-	opts := &edgetts.SynthesizeOptions{
-		Text:                    longText,
-		Voice:                   "zh-CN-XiaoxiaoNeural",
-		Rate:                    1.0,
-		Volume:                  1.0,
-		Pitch:                   1.0,
-		WordBoundaryEnabled:     true,
-		SentenceBoundaryEnabled: true,
-		BoundaryCallback: func(event tts.BoundaryEvent) {
-			switch event.Type {
-			case "WordBoundary":
-				wordCount++
-			case "SentenceBoundary":
-				sentenceCount++
-			}
-			// 只打印前几个示例
-			if wordCount+sentenceCount <= 5 {
-				fmt.Printf("  [chunk=%d %s] Offset: %dms, Duration: %dms, Text: %s\n",
-					event.ChunkIndex, event.Type, event.OffsetMs, event.DurationMs, event.Text)
-			}
-		},
+	request := tts.SynthesisRequest{
+		InputMode:          tts.InputModePlainText,
+		Text:               longText,
+		VoiceID:            "zh-CN-XiaoxiaoNeural",
+		NeedBoundaryEvents: true,
 	}
 
-	audioData, err := provider.Synthesize(ctx, opts)
+	result, err := provider.Synthesize(ctx, request)
 	if err != nil {
 		log.Fatalf("同步合成失败: %v", err)
 	}
+	wordCount := 0
+	sentenceCount := 0
+	for _, event := range result.BoundaryEvents {
+		switch event.Type {
+		case tts.BoundaryTypeWord:
+			wordCount++
+		case tts.BoundaryTypeSentence:
+			sentenceCount++
+		}
+		if wordCount+sentenceCount <= 5 {
+			fmt.Printf("  [chunk=%d %s] Offset: %dms, Duration: %dms, Text: %s\n",
+				event.ChunkIndex, event.Type, event.OffsetMs, event.DurationMs, event.Text)
+		}
+	}
 
-	fmt.Printf("同步合成完成，音频大小: %d 字节\n", len(audioData))
+	fmt.Printf("同步合成完成，音频大小: %d 字节\n", len(result.Audio))
 	fmt.Printf("词边界数量: %d, 句边界数量: %d\n", wordCount, sentenceCount)
 
 	// 保存音频文件
 	outputFile := "long_text_sync.mp3"
-	if err := os.WriteFile(outputFile, audioData, 0644); err != nil {
-		log.Fatalf("保存音频失败: %v", err)
+	if writeErr := os.WriteFile(outputFile, result.Audio, 0o600); writeErr != nil {
+		log.Fatalf("保存音频失败: %v", writeErr)
 	}
 	fmt.Printf("音频已保存到: %s\n", outputFile)
 
 	// 测试流式合成
 	fmt.Println("\n=== 测试流式合成 ===")
-	wordCount = 0
-	sentenceCount = 0
-
-	streamOpts := &edgetts.SynthesizeOptions{
-		Text:                    longText,
-		Voice:                   "zh-CN-XiaoxiaoNeural",
-		Rate:                    1.0,
-		Volume:                  1.0,
-		Pitch:                   1.0,
-		WordBoundaryEnabled:     true,
-		SentenceBoundaryEnabled: true,
-		BoundaryCallback: func(event tts.BoundaryEvent) {
-			switch event.Type {
-			case "WordBoundary":
-				wordCount++
-			case "SentenceBoundary":
-				sentenceCount++
-			}
-		},
+	streamRequest := tts.SynthesisRequest{
+		InputMode: tts.InputModePlainText,
+		Text:      longText,
+		VoiceID:   "zh-CN-XiaoxiaoNeural",
 	}
 
-	stream, err := provider.SynthesizeStream(ctx, streamOpts)
+	stream, err := provider.SynthesizeStream(ctx, streamRequest)
 	if err != nil {
 		log.Fatalf("流式合成失败: %v", err)
 	}
-	defer stream.Close()
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			log.Printf("关闭流失败: %v", closeErr)
+		}
+	}()
 
 	var streamAudioData []byte
 	chunkCount := 0
 	for {
 		chunk, err := stream.Read()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			log.Fatalf("读取流式音频失败: %v", err)
@@ -112,12 +97,12 @@ func main() {
 	}
 
 	fmt.Printf("流式合成完成，接收 %d 个音频块，总大小: %d 字节\n", chunkCount, len(streamAudioData))
-	fmt.Printf("词边界数量: %d, 句边界数量: %d\n", wordCount, sentenceCount)
+	fmt.Println("流式接口仅返回音频块；边界事件请改用同步 Synthesize 读取结果中的 BoundaryEvents")
 
 	// 保存流式音频文件
 	streamOutputFile := "long_text_stream.mp3"
-	if err := os.WriteFile(streamOutputFile, streamAudioData, 0644); err != nil {
-		log.Fatalf("保存流式音频失败: %v", err)
+	if writeErr := os.WriteFile(streamOutputFile, streamAudioData, 0o600); writeErr != nil {
+		log.Fatalf("保存流式音频失败: %v", writeErr)
 	}
 	fmt.Printf("流式音频已保存到: %s\n", streamOutputFile)
 

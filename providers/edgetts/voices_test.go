@@ -2,6 +2,7 @@ package edgetts
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -146,13 +147,13 @@ func TestVoiceCacheLocaleFilteringMatchesDirectFiltering(t *testing.T) {
 		},
 	}
 
-	cache := tts.NewVoiceCache(func(ctx context.Context) ([]tts.Voice, error) {
+	cache, _ := tts.NewVoiceCache(func(ctx context.Context) ([]tts.Voice, error) {
 		return filterAndConvertVoices(entries, ""), nil
 	})
 
 	for _, locale := range []string{"zh", "en", "zh-CN", "en-US", "e", "en-", "zh-"} {
 		want := filterAndConvertVoices(entries, locale)
-		got, err := cache.Get(context.Background(), locale)
+		got, err := cache.Get(context.Background(), tts.VoiceFilter{Language: locale})
 		if err != nil {
 			t.Fatalf("cache.Get(%q) error: %v", locale, err)
 		}
@@ -195,7 +196,8 @@ func TestFilterAndConvertVoices_RejectsInvalidLocalePrefixes(t *testing.T) {
 }
 
 func TestFetchVoiceList_ForbiddenWithGenericDateStaysAuthFailed(t *testing.T) {
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	p := &Provider{clientToken: "token"}
+	p.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusForbidden,
 			Header: http.Header{
@@ -205,13 +207,13 @@ func TestFetchVoiceList_ForbiddenWithGenericDateStaysAuthFailed(t *testing.T) {
 		}, nil
 	})}
 
-	_, err := fetchVoiceList(context.Background(), client, "token")
+	_, err := p.fetchVoiceList(context.Background())
 	if err == nil {
 		t.Fatal("fetchVoiceList() error = nil, want auth failure")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("fetchVoiceList() error type = %T, want *tts.Error", err)
 	}
 	if ttsErr.Code != tts.ErrCodeAuthFailed {
@@ -233,7 +235,7 @@ func TestProviderListVoices_NilContextUsesBackground(t *testing.T) {
 		}, nil
 	})}
 
-	voices, err := provider.ListVoices(nilContextForTest(), "en-US")
+	voices, err := provider.ListVoices(nilContextForTest(), tts.VoiceFilter{Language: "en-US"})
 	if err != nil {
 		t.Fatalf("ListVoices(nil, ...) error: %v", err)
 	}
@@ -246,7 +248,8 @@ func TestProviderListVoices_NilContextUsesBackground(t *testing.T) {
 }
 
 func TestFetchVoiceList_ForbiddenWithMalformedClockSkewDateStaysAuthFailed(t *testing.T) {
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	p := &Provider{clientToken: "token"}
+	p.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusForbidden,
 			Header: http.Header{
@@ -256,13 +259,13 @@ func TestFetchVoiceList_ForbiddenWithMalformedClockSkewDateStaysAuthFailed(t *te
 		}, nil
 	})}
 
-	_, err := fetchVoiceList(context.Background(), client, "token")
+	_, err := p.fetchVoiceList(context.Background())
 	if err == nil {
 		t.Fatal("fetchVoiceList() error = nil, want auth failure")
 	}
 
-	ttsErr, ok := err.(*tts.Error)
-	if !ok {
+	var ttsErr *tts.Error
+	if !errors.As(err, &ttsErr) {
 		t.Fatalf("fetchVoiceList() error type = %T, want *tts.Error", err)
 	}
 	if ttsErr.Code != tts.ErrCodeAuthFailed {

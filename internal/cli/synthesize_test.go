@@ -72,21 +72,21 @@ func TestSynthesizeReadInputText_StdinExceedsLimit(t *testing.T) {
 		t.Fatalf("os.Pipe() error: %v", err)
 	}
 	defer func() {
-		if err := r.Close(); err != nil {
-			t.Errorf("close read pipe: %v", err)
+		if closeErr := r.Close(); closeErr != nil {
+			t.Errorf("close read pipe: %v", closeErr)
 		}
 	}()
 	os.Stdin = r
 	defer func() { os.Stdin = oldStdin }()
 
-	if _, err := w.Write([]byte("hello")); err != nil {
+	if _, writeErr := w.Write([]byte("hello")); writeErr != nil {
 		if closeErr := w.Close(); closeErr != nil {
 			t.Errorf("close write pipe after write failure: %v", closeErr)
 		}
-		t.Fatalf("write stdin pipe: %v", err)
+		t.Fatalf("write stdin pipe: %v", writeErr)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("close write pipe: %v", err)
+	if closeErr := w.Close(); closeErr != nil {
+		t.Fatalf("close write pipe: %v", closeErr)
 	}
 
 	_, err = cmd.readInputText()
@@ -118,9 +118,12 @@ func TestSynthesizeRun_RejectsInvalidMaxAttemptsBeforeProviderCreation(t *testin
 	withTestRegistry(t, map[string]ProviderFactory{})
 
 	factoryCalled := false
-	registry["fake"] = func(cfg *ProviderConfig) (ProviderAdapter, error) {
-		factoryCalled = true
-		return &testAdapter{name: "fake"}, nil
+	registry["fake"] = ProviderRegistration{
+		Factory: func(cfg *ProviderConfig) (tts.Provider, error) {
+			factoryCalled = true
+			return &testAdapter{name: "fake"}, nil
+		},
+		DefaultVoice: "voice-1",
 	}
 
 	cmd := NewSynthesizeCmd()
@@ -146,9 +149,12 @@ func TestSynthesizeRun_RejectsInvalidHTTPTimeoutBeforeProviderCreation(t *testin
 	withTestRegistry(t, map[string]ProviderFactory{})
 
 	factoryCalled := false
-	registry["fake"] = func(cfg *ProviderConfig) (ProviderAdapter, error) {
-		factoryCalled = true
-		return &testAdapter{name: "fake"}, nil
+	registry["fake"] = ProviderRegistration{
+		Factory: func(cfg *ProviderConfig) (tts.Provider, error) {
+			factoryCalled = true
+			return &testAdapter{name: "fake"}, nil
+		},
+		DefaultVoice: "voice-1",
 	}
 
 	cmd := NewSynthesizeCmd()
@@ -190,7 +196,7 @@ func TestSynthesizeRun_RejectsInvalidProxyAsUsageError(t *testing.T) {
 func TestSynthesizeRun_PreservesProviderFactoryErrorChain(t *testing.T) {
 	sentinel := errors.New("provider config rejected")
 	withTestRegistry(t, map[string]ProviderFactory{
-		"fake": func(cfg *ProviderConfig) (ProviderAdapter, error) {
+		"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
 			_ = cfg
 			return nil, sentinel
 		},
@@ -217,7 +223,7 @@ func TestSynthesizeRun_PreservesProviderFactoryErrorChain(t *testing.T) {
 
 func TestSynthesizeRun_AutoOutputPathReservationIsAtomic(t *testing.T) {
 	withTestRegistry(t, map[string]ProviderFactory{
-		"fake": func(cfg *ProviderConfig) (ProviderAdapter, error) {
+		"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
 			_ = cfg
 			return &testAdapter{name: "fake"}, nil
 		},
@@ -228,12 +234,12 @@ func TestSynthesizeRun_AutoOutputPathReservationIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Getwd() error: %v", err)
 	}
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("os.Chdir(%q) error: %v", tmpDir, err)
+	if chdirErr := os.Chdir(tmpDir); chdirErr != nil {
+		t.Fatalf("os.Chdir(%q) error: %v", tmpDir, chdirErr)
 	}
 	t.Cleanup(func() {
-		if err := os.Chdir(oldWD); err != nil {
-			t.Fatalf("restore working directory: %v", err)
+		if restoreErr := os.Chdir(oldWD); restoreErr != nil {
+			t.Fatalf("restore working directory: %v", restoreErr)
 		}
 	})
 
@@ -314,72 +320,316 @@ func TestSynthesizeRun_AutoOutputPathReservationIsAtomic(t *testing.T) {
 	}
 }
 
-type blockingSynthesizeAdapter struct {
-	name    string
-	budgets chan time.Duration
+type deadlineInspectingSynthesizeAdapter struct {
+	name        string
+	hasDeadline chan bool
 }
 
-func (a *blockingSynthesizeAdapter) Name() string { return a.name }
+type recordingSynthesizeAdapter struct {
+	name         string
+	capabilities tts.ProviderCapabilities
+	lastRequest  tts.SynthesisRequest
+	callCount    int
+}
 
-func (a *blockingSynthesizeAdapter) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
+func (a *deadlineInspectingSynthesizeAdapter) Name() string { return a.name }
+
+func (a *deadlineInspectingSynthesizeAdapter) Capabilities() tts.ProviderCapabilities {
+	return testProviderCapabilities(true, tts.AudioFormatMP3)
+}
+
+func (a *deadlineInspectingSynthesizeAdapter) ListVoices(ctx context.Context, filter tts.VoiceFilter) ([]tts.Voice, error) {
+	_ = ctx
+	_ = filter
 	return nil, errors.New("not implemented")
 }
 
-func (a *blockingSynthesizeAdapter) Synthesize(ctx context.Context, opts *SynthesizeRequest) ([]byte, error) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return nil, errors.New("missing context deadline")
-	}
+func (a *deadlineInspectingSynthesizeAdapter) Synthesize(ctx context.Context, request tts.SynthesisRequest) (*tts.SynthesisResult, error) {
+	_, ok := ctx.Deadline()
 	select {
-	case a.budgets <- time.Until(deadline):
+	case a.hasDeadline <- ok:
 	default:
 	}
-	<-ctx.Done()
-	return nil, ctx.Err()
+	return &tts.SynthesisResult{
+		Audio:    []byte("audio"),
+		Format:   tts.AudioFormatMP3,
+		Provider: a.name,
+		VoiceID:  request.VoiceID,
+	}, nil
 }
 
-func (a *blockingSynthesizeAdapter) DefaultVoice() string { return "voice-1" }
+func (a *deadlineInspectingSynthesizeAdapter) SynthesizeStream(ctx context.Context, request tts.SynthesisRequest) (tts.AudioStream, error) {
+	_ = ctx
+	_ = request
+	return nil, errors.New("not implemented")
+}
 
-func (a *blockingSynthesizeAdapter) DefaultFormat() string { return "mp3" }
+func (a *recordingSynthesizeAdapter) Name() string { return a.name }
 
-func (a *blockingSynthesizeAdapter) SupportsRateVolumePitch() bool { return true }
+func (a *recordingSynthesizeAdapter) Capabilities() tts.ProviderCapabilities {
+	if a.capabilities.PreferredAudioFormat == "" && len(a.capabilities.SupportedFormats) == 0 {
+		return testProviderCapabilities(true, tts.AudioFormatMP3)
+	}
+	return a.capabilities.Clone()
+}
 
-func TestSynthesizeRun_UsesSharedTimeoutBudget(t *testing.T) {
-	budgets := make(chan time.Duration, 1)
+func (a *recordingSynthesizeAdapter) ListVoices(ctx context.Context, filter tts.VoiceFilter) ([]tts.Voice, error) {
+	_ = ctx
+	_ = filter
+	return nil, errors.New("not implemented")
+}
+
+func (a *recordingSynthesizeAdapter) Synthesize(ctx context.Context, request tts.SynthesisRequest) (*tts.SynthesisResult, error) {
+	a.callCount++
+	a.lastRequest = request
+	return &tts.SynthesisResult{
+		Audio:    []byte("audio"),
+		Format:   tts.AudioFormatMP3,
+		Provider: a.name,
+		VoiceID:  request.VoiceID,
+	}, nil
+}
+
+func (a *recordingSynthesizeAdapter) SynthesizeStream(ctx context.Context, request tts.SynthesisRequest) (tts.AudioStream, error) {
+	_ = ctx
+	_ = request
+	return nil, errors.New("not implemented")
+}
+
+func TestSynthesizeRun_RejectsUnsupportedProsodyFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		flagName  string
+		flagValue string
+	}{
+		{name: "rate", flagName: "--rate", flagValue: "+10%"},
+		{name: "volume", flagName: "--volume", flagValue: "+10%"},
+		{name: "pitch", flagName: "--pitch", flagValue: "+10%"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := &recordingSynthesizeAdapter{
+				name:         "fake",
+				capabilities: testProviderCapabilities(false, tts.AudioFormatMP3),
+			}
+			withTestRegistry(t, map[string]ProviderFactory{
+				"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
+					_ = cfg
+					return adapter, nil
+				},
+			})
+
+			cmd := NewSynthesizeCmd()
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			err := cmd.Run([]string{"--provider", "fake", "--text", "hello", "--stdout", tt.flagName, tt.flagValue}, &stdout, &stderr)
+			if err == nil {
+				t.Fatal("Run() expected error, got nil")
+			}
+			var usageErr *UsageError
+			if !errors.As(err, &usageErr) {
+				t.Fatalf("Run() error = %T, want *UsageError", err)
+			}
+			if !strings.Contains(usageErr.Message, tt.flagName) {
+				t.Fatalf("usage error message = %q, want unsupported flag %q", usageErr.Message, tt.flagName)
+			}
+			if adapter.callCount != 0 {
+				t.Fatalf("Synthesize() call count = %d, want 0 when prosody is unsupported", adapter.callCount)
+			}
+		})
+	}
+}
+
+func TestSynthesizeRun_NeutralProsodySpellingsRemainPlainText(t *testing.T) {
+	tests := []struct {
+		name      string
+		flagName  string
+		flagValue string
+	}{
+		{name: "rate 0%", flagName: "--rate", flagValue: "0%"},
+		{name: "rate +0.0%", flagName: "--rate", flagValue: "+0.0%"},
+		{name: "rate -0%", flagName: "--rate", flagValue: "-0%"},
+		{name: "volume 0%", flagName: "--volume", flagValue: "0%"},
+		{name: "volume +0.0%", flagName: "--volume", flagValue: "+0.0%"},
+		{name: "volume -0%", flagName: "--volume", flagValue: "-0%"},
+		{name: "pitch 0%", flagName: "--pitch", flagValue: "0%"},
+		{name: "pitch +0.0%", flagName: "--pitch", flagValue: "+0.0%"},
+		{name: "pitch -0%", flagName: "--pitch", flagValue: "-0%"},
+	}
+
+	for _, supportsProsody := range []bool{false, true} {
+		supportsProsody := supportsProsody
+		providerMode := "unsupported"
+		if supportsProsody {
+			providerMode = "supported"
+		}
+
+		for _, tt := range tests {
+			tt := tt
+			t.Run(providerMode+"/"+tt.name, func(t *testing.T) {
+				adapter := &recordingSynthesizeAdapter{
+					name:         "fake",
+					capabilities: testProviderCapabilities(supportsProsody, tts.AudioFormatMP3),
+				}
+				withTestRegistry(t, map[string]ProviderFactory{
+					"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
+						_ = cfg
+						return adapter, nil
+					},
+				})
+
+				cmd := NewSynthesizeCmd()
+				var stdout bytes.Buffer
+				var stderr bytes.Buffer
+				err := cmd.Run([]string{"--provider", "fake", "--text", "hello", "--stdout", tt.flagName, tt.flagValue}, &stdout, &stderr)
+				if err != nil {
+					t.Fatalf("Run() unexpected error: %v", err)
+				}
+				if adapter.callCount != 1 {
+					t.Fatalf("Synthesize() call count = %d, want 1", adapter.callCount)
+				}
+				if adapter.lastRequest.InputMode != tts.InputModePlainText {
+					t.Fatalf("request.InputMode = %q, want %q", adapter.lastRequest.InputMode, tts.InputModePlainText)
+				}
+				if !adapter.lastRequest.Prosody.IsZero() {
+					t.Fatalf("request.Prosody = %+v, want zero-value prosody", adapter.lastRequest.Prosody)
+				}
+				if stdout.String() != "audio" {
+					t.Fatalf("stdout = %q, want synthesized audio bytes", stdout.String())
+				}
+				if stderr.Len() != 0 {
+					t.Fatalf("stderr = %q, want empty", stderr.String())
+				}
+			})
+		}
+	}
+}
+
+func TestSynthesizeRun_ProsodyFlagsUsePlainTextWithProsody(t *testing.T) {
+	adapter := &recordingSynthesizeAdapter{
+		name:         "fake",
+		capabilities: testProviderCapabilities(true, tts.AudioFormatMP3),
+	}
 	withTestRegistry(t, map[string]ProviderFactory{
-		"fake": func(cfg *ProviderConfig) (ProviderAdapter, error) {
+		"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
 			_ = cfg
-			return &blockingSynthesizeAdapter{name: "fake", budgets: budgets}, nil
+			return adapter, nil
 		},
 	})
 
 	cmd := NewSynthesizeCmd()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	start := time.Now()
-	err := cmd.Run([]string{"--provider", "fake", "--text", "hello", "--http-timeout", "25ms", "--max-attempts", "2"}, &stdout, &stderr)
-	if err == nil {
-		t.Fatal("Run() expected error, got nil")
+	err := cmd.Run([]string{
+		"--provider", "fake",
+		"--text", "hello",
+		"--voice", "voice-1",
+		"--stdout",
+		"--rate", "+25%",
+		"--volume", "-20%",
+		"--pitch", "+10%",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("Run() unexpected error: %v", err)
 	}
-	var runtimeErr *RuntimeError
-	if !errors.As(err, &runtimeErr) {
-		t.Fatalf("Run() error = %T, want *RuntimeError", err)
+	if adapter.callCount != 1 {
+		t.Fatalf("Synthesize() call count = %d, want 1", adapter.callCount)
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run() error = %v, want context deadline exceeded in error chain", err)
+	if adapter.lastRequest.InputMode != tts.InputModePlainTextWithProsody {
+		t.Fatalf("request.InputMode = %q, want %q", adapter.lastRequest.InputMode, tts.InputModePlainTextWithProsody)
+	}
+	if adapter.lastRequest.Text != "hello" {
+		t.Fatalf("request.Text = %q, want %q", adapter.lastRequest.Text, "hello")
+	}
+	if adapter.lastRequest.VoiceID != "voice-1" {
+		t.Fatalf("request.VoiceID = %q, want %q", adapter.lastRequest.VoiceID, "voice-1")
+	}
+	wantProsody := tts.ProsodyParams{Rate: 1.25, Volume: 0.8, Pitch: 1.1}
+	if adapter.lastRequest.Prosody != wantProsody {
+		t.Fatalf("request.Prosody = %+v, want %+v", adapter.lastRequest.Prosody, wantProsody)
+	}
+	if stdout.String() != "audio" {
+		t.Fatalf("stdout = %q, want synthesized audio bytes", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSynthesizeRun_VolumeMinus100PreservesExplicitMute(t *testing.T) {
+	adapter := &recordingSynthesizeAdapter{
+		name:         "fake",
+		capabilities: testProviderCapabilities(true, tts.AudioFormatMP3),
+	}
+	withTestRegistry(t, map[string]ProviderFactory{
+		"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
+			_ = cfg
+			return adapter, nil
+		},
+	})
+
+	cmd := NewSynthesizeCmd()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := cmd.Run([]string{
+		"--provider", "fake",
+		"--text", "hello",
+		"--stdout",
+		"--volume", "-100%",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("Run() unexpected error: %v", err)
+	}
+	if adapter.callCount != 1 {
+		t.Fatalf("Synthesize() call count = %d, want 1", adapter.callCount)
+	}
+	if adapter.lastRequest.InputMode != tts.InputModePlainTextWithProsody {
+		t.Fatalf("request.InputMode = %q, want %q", adapter.lastRequest.InputMode, tts.InputModePlainTextWithProsody)
+	}
+	if !adapter.lastRequest.Prosody.HasVolume() {
+		t.Fatal("request.Prosody.HasVolume() = false, want true")
+	}
+	if adapter.lastRequest.Prosody.Volume != 0 {
+		t.Fatalf("request.Prosody.Volume = %v, want 0", adapter.lastRequest.Prosody.Volume)
+	}
+	if adapter.lastRequest.Prosody.HasRate() {
+		t.Fatal("request.Prosody.HasRate() = true, want false")
+	}
+	if adapter.lastRequest.Prosody.HasPitch() {
+		t.Fatal("request.Prosody.HasPitch() = true, want false")
+	}
+	if stdout.String() != "audio" {
+		t.Fatalf("stdout = %q, want synthesized audio bytes", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestSynthesizeRun_DoesNotImposeCommandDeadline(t *testing.T) {
+	hasDeadline := make(chan bool, 1)
+	withTestRegistry(t, map[string]ProviderFactory{
+		"fake": func(cfg *ProviderConfig) (tts.Provider, error) {
+			_ = cfg
+			return &deadlineInspectingSynthesizeAdapter{name: "fake", hasDeadline: hasDeadline}, nil
+		},
+	})
+
+	cmd := NewSynthesizeCmd()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := cmd.Run([]string{"--provider", "fake", "--text", "hello", "--stdout", "--http-timeout", "25ms", "--max-attempts", "2"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("Run() unexpected error: %v", err)
 	}
 
-	remaining := <-budgets
-	if remaining <= 0 || remaining > 75*time.Millisecond {
-		t.Fatalf("remaining deadline budget = %v, want within (0, 75ms]", remaining)
+	if <-hasDeadline {
+		t.Fatal("Synthesize() context unexpectedly had a command-level deadline")
 	}
-
-	elapsed := time.Since(start)
-	if elapsed > 90*time.Millisecond {
-		t.Fatalf("Run() elapsed = %v, want <= 90ms", elapsed)
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
+	if stdout.String() != "audio" {
+		t.Fatalf("stdout = %q, want synthesized audio bytes", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())

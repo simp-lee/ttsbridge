@@ -6,7 +6,11 @@ import (
 )
 
 // buildSSML constructs SSML from options
-func buildSSML(opts *SynthesizeOptions) string {
+func buildSSML(opts *synthesizeOptions) string {
+	if opts == nil {
+		opts = newSynthesizeOptions()
+	}
+
 	voice := opts.Voice
 	if voice == "" {
 		voice = defaultVoice
@@ -22,18 +26,18 @@ func buildSSML(opts *SynthesizeOptions) string {
 	)
 }
 
-func ssmlWrapperBytes(opts *SynthesizeOptions) int {
+func ssmlWrapperBytes(opts *synthesizeOptions) int {
 	if opts == nil {
-		opts = &SynthesizeOptions{}
+		opts = newSynthesizeOptions()
 	}
 	optsCopy := *opts
 	optsCopy.Text = ""
 	return len([]byte(buildSSML(&optsCopy)))
 }
 
-// formatProsody formats rate/volume: 1.0 = +0%, 1.5 = +50%, 0.5 = -50%
+// formatProsody formats rate/volume: 1.0 = +0%, 0.0 = -100%, 1.5 = +50%.
 func formatProsody(value float64) string {
-	if value == 0 || value == 1.0 {
+	if value == 1.0 {
 		return "+0%"
 	}
 	percent := (value - 1.0) * 100
@@ -43,9 +47,9 @@ func formatProsody(value float64) string {
 	return fmt.Sprintf("%.0f%%", percent)
 }
 
-// formatPitch formats pitch: 1.0 = +0Hz, 1.5 = +50%, 0.5 = -50%
+// formatPitch formats pitch: 1.0 = +0Hz, 0.0 = -100%, 1.5 = +50%.
 func formatPitch(value float64) string {
-	if value == 0 || value == 1.0 {
+	if value == 1.0 {
 		return "+0Hz"
 	}
 	percent := (value - 1.0) * 100

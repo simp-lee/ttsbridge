@@ -14,22 +14,20 @@ import (
 	"github.com/simp-lee/ttsbridge/tts"
 )
 
-// ListVoices lists available voices for the specified locale.
-// When voice caching is enabled (via WithVoiceCache), the cached list is used
-// and filtered by locale. Otherwise the list is fetched from the remote API.
-func (p *Provider) ListVoices(ctx context.Context, locale string) ([]tts.Voice, error) {
+// ListVoices lists available voices for the specified provider-neutral filter.
+// When voice caching is enabled (via WithVoiceCache), the cached list is used.
+func (p *Provider) ListVoices(ctx context.Context, filter tts.VoiceFilter) ([]tts.Voice, error) {
 	ctx = normalizeEdgeTTSContext(ctx)
 	if err := p.runtimeConfigError(); err != nil {
 		return nil, err
 	}
 	if p.voiceCache != nil {
-		return p.voiceCache.Get(ctx, locale)
+		return p.voiceCache.Get(ctx, filter)
 	}
 
 	entries, err := retry.DoWithResult(func() ([]voiceListEntry, error) {
-		return fetchVoiceList(ctx, p.client, p.clientToken)
+		return p.fetchVoiceList(ctx)
 	}, tts.RetryOptions(ctx, p.maxAttempts)...)
-
 	if err != nil {
 		if retry.IsRetryError(err) {
 			return nil, &tts.Error{
@@ -42,7 +40,7 @@ func (p *Provider) ListVoices(ctx context.Context, locale string) ([]tts.Voice, 
 		return nil, err
 	}
 
-	return filterAndConvertVoices(entries, locale), nil
+	return tts.FilterVoices(filterAndConvertVoices(entries, ""), filter), nil
 }
 
 type voiceListEntry struct {
@@ -63,11 +61,11 @@ type voiceListEntry struct {
 	} `json:"VoiceTag"`
 }
 
-func fetchVoiceList(ctx context.Context, client *http.Client, token string) ([]voiceListEntry, error) {
+func (p *Provider) fetchVoiceList(ctx context.Context) ([]voiceListEntry, error) {
 	voiceURL := fmt.Sprintf(
 		"%s&Sec-MS-GEC=%s&Sec-MS-GEC-Version=%s",
-		fmt.Sprintf(voicesURLTemplate, baseURL, token),
-		GenerateSecMsGec(token),
+		fmt.Sprintf(voicesURLTemplate, baseURL, p.clientToken),
+		p.generateSecMsGec(),
 		secMsGecVersion,
 	)
 
@@ -85,7 +83,7 @@ func fetchVoiceList(ctx context.Context, client *http.Client, token string) ([]v
 	}
 
 	applyVoiceHeaders(req)
-	resp, err := client.Do(req)
+	resp, err := p.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -102,7 +100,7 @@ func fetchVoiceList(ctx context.Context, client *http.Client, token string) ([]v
 	// Clock skew detection and adjustment on 403 Forbidden
 	if resp.StatusCode == http.StatusForbidden {
 		detail := readResponseBody(io.LimitReader(resp.Body, 4096))
-		return nil, classifyForbiddenResponse(resp.Header.Get("Date"), detail)
+		return nil, p.classifyForbiddenResponse(resp.Header.Get("Date"), detail)
 	}
 
 	if resp.StatusCode != http.StatusOK {

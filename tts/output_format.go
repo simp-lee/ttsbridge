@@ -323,7 +323,8 @@ func (r *FormatRegistry) Probe(ctx context.Context, formatID string) (*OutputFor
 	return &cp, nil
 }
 
-// ProbeAll probes all FormatUnverified formats in the registry.
+// ProbeAll probes all formats in the registry that are either unverified or
+// have an expired runtime probe result.
 // It returns counts of newly available and unavailable formats.
 // Formats are probed sequentially with the configured probe interval to avoid
 // rate limiting. Returns early if the context is cancelled. Probe errors are
@@ -333,11 +334,15 @@ func (r *FormatRegistry) ProbeAll(ctx context.Context) (available, unavailable i
 		ctx = context.Background()
 	}
 
-	// Snapshot unverified format IDs
+	// Snapshot formats that still need verification.
 	r.mu.RLock()
 	var ids []string
+	probeTTL := r.probeTTL
 	for id, f := range r.formats {
-		if f.Status == FormatUnverified {
+		if f == nil || isConstantFormat(f) {
+			continue
+		}
+		if f.Status == FormatUnverified || (isVerifiedProbeStatus(f.Status) && isProbeExpiredWithTTL(f, probeTTL)) {
 			ids = append(ids, id)
 		}
 	}
@@ -452,15 +457,22 @@ func (r *FormatRegistry) CloneDeclaredClean() *FormatRegistry {
 // the registry's probeTTL. A format with a zero VerifiedAt is always considered
 // expired.
 func (r *FormatRegistry) IsProbeExpired(f *OutputFormat) bool {
+	r.mu.RLock()
+	ttl := r.probeTTL
+	r.mu.RUnlock()
+	return isProbeExpiredWithTTL(f, ttl)
+}
+
+func isProbeExpiredWithTTL(f *OutputFormat, ttl time.Duration) bool {
+	if f == nil {
+		return true
+	}
 	if isConstantFormat(f) {
 		return false
 	}
 	if f.VerifiedAt.IsZero() {
 		return true
 	}
-	r.mu.RLock()
-	ttl := r.probeTTL
-	r.mu.RUnlock()
 	return time.Since(f.VerifiedAt) >= ttl
 }
 

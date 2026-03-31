@@ -19,11 +19,12 @@ var _ tts.FormatProber = (*edgeTTSProber)(nil)
 // ProbeFormat synthesizes the word "test" using the given format and reports
 // whether the service returned valid audio data (len > 0).
 func (p *edgeTTSProber) ProbeFormat(ctx context.Context, formatID string) (bool, error) {
-	data, err := p.provider.synthesizeForProbe(ctx, &SynthesizeOptions{
-		Text:         "test",
-		Voice:        defaultVoice,
-		OutputFormat: formatID,
-	})
+	options := newSynthesizeOptions()
+	options.Text = "test"
+	options.Voice = defaultVoice
+	options.OutputFormat = formatID
+
+	data, err := p.provider.synthesizeForProbe(ctx, options)
 	if err != nil {
 		var ttsErr *tts.Error
 		if errors.As(err, &ttsErr) && ttsErr.Code == tts.ErrCodeUnsupportedFormat {

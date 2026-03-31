@@ -16,6 +16,8 @@ func TestParsePercent(t *testing.T) {
 		{"+25%", 1.25, false},
 		{"-100%", 0.0, false},
 		{"0%", 1.0, false},
+		{"-0%", 1.0, false},
+		{"+0.0%", 1.0, false},
 		{"50%", 1.5, false},
 		{"", 1.0, false},
 		{"+0.5%", 1.005, false},

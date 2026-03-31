@@ -70,6 +70,18 @@ type ProviderHealth struct {
 	timedOutCheck   <-chan struct{}
 }
 
+type providerHealthCheckRun struct {
+	checker func(ctx context.Context) bool
+	timeout time.Duration
+	doneCh  chan struct{}
+}
+
+type providerHealthCheckOutcome struct {
+	ok       bool
+	timedOut bool
+	stopped  bool
+}
+
 // ProviderHealthOption configures a ProviderHealth.
 type ProviderHealthOption func(*ProviderHealth)
 
@@ -265,84 +277,104 @@ func (ph *ProviderHealth) run(ctx context.Context, done chan struct{}) {
 
 // performCheck executes a single health check and updates state accordingly.
 func (ph *ProviderHealth) performCheck(ctx context.Context) {
+	run, ok := ph.beginCheck()
+	if !ok {
+		return
+	}
+
+	outcome := ph.runCheck(ctx, run)
+	ph.applyCheckOutcome(run.doneCh, outcome)
+}
+
+func (ph *ProviderHealth) beginCheck() (providerHealthCheckRun, bool) {
 	ph.mu.Lock()
+	defer ph.mu.Unlock()
+
 	if ph.checkerStuck {
-		ph.mu.Unlock()
-		return
+		return providerHealthCheckRun{}, false
 	}
-	if ph.activeCheckDone != nil {
-		if isClosed(ph.activeCheckDone) {
-			ph.clearActiveCheckLocked(ph.activeCheckDone)
-		} else if ph.timedOutCheck != nil {
-			ph.isHealthy = false
-			ph.failureCount = 0
-			ph.cooldownUntil = time.Time{}
-			ph.checkerStuck = true
-			ph.mu.Unlock()
-			return
-		}
+	if ph.reconcileInFlightChecksLocked() {
+		return providerHealthCheckRun{}, false
 	}
-	if ph.checkInFlight {
-		if ph.timedOutCheck != nil {
-			if isClosed(ph.timedOutCheck) {
-				ph.clearTimedOutCheckLocked(ph.timedOutCheck)
-			} else {
-				ph.isHealthy = false
-				ph.failureCount = 0
-				ph.cooldownUntil = time.Time{}
-				ph.checkerStuck = true
-				ph.mu.Unlock()
-				return
-			}
-		}
+	if ph.shouldSkipCheckLocked(time.Now()) {
+		return providerHealthCheckRun{}, false
 	}
-	if time.Now().Before(ph.cooldownUntil) || ph.checkInFlight {
-		ph.mu.Unlock()
-		return
-	}
-	checker := ph.checker
-	timeout := ph.checkTimeout
+
 	doneCh := make(chan struct{})
 	ph.checkInFlight = true
 	ph.activeCheckDone = doneCh
-	ph.mu.Unlock()
+	return providerHealthCheckRun{checker: ph.checker, timeout: ph.checkTimeout, doneCh: doneCh}, true
+}
 
-	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+func (ph *ProviderHealth) reconcileInFlightChecksLocked() bool {
+	if activeDone := ph.activeCheckDone; activeDone != nil {
+		if isClosed(activeDone) {
+			ph.clearActiveCheckLocked(activeDone)
+		} else if ph.timedOutCheck != nil {
+			ph.markCheckerStuckLocked()
+			return true
+		}
+	}
+	if ph.checkInFlight && ph.timedOutCheck != nil {
+		if isClosed(ph.timedOutCheck) {
+			ph.clearTimedOutCheckLocked(ph.timedOutCheck)
+		} else {
+			ph.markCheckerStuckLocked()
+			return true
+		}
+	}
+	return false
+}
+
+func (ph *ProviderHealth) shouldSkipCheckLocked(now time.Time) bool {
+	return now.Before(ph.cooldownUntil) || ph.checkInFlight
+}
+
+func (ph *ProviderHealth) markCheckerStuckLocked() {
+	ph.isHealthy = false
+	ph.failureCount = 0
+	ph.cooldownUntil = time.Time{}
+	ph.checkerStuck = true
+}
+
+func (ph *ProviderHealth) runCheck(ctx context.Context, run providerHealthCheckRun) providerHealthCheckOutcome {
+	checkCtx, cancel := context.WithTimeout(ctx, run.timeout)
 	defer cancel()
 
 	resultCh := make(chan bool, 1)
 	go func() {
-		defer close(doneCh)
-		ok := checker(checkCtx)
+		defer close(run.doneCh)
+		ok := run.checker(checkCtx)
 		select {
 		case resultCh <- ok:
 		default:
 		}
 	}()
 
-	ok := false
-	timedOut := false
-	stopped := false
+	var outcome providerHealthCheckOutcome
 	select {
-	case ok = <-resultCh:
+	case outcome.ok = <-resultCh:
 	case <-ctx.Done():
-		stopped = true
+		outcome.stopped = true
 	case <-checkCtx.Done():
-		timedOut = checkCtx.Err() == context.DeadlineExceeded
-		stopped = !timedOut
-		ok = false
+		outcome.timedOut = checkCtx.Err() == context.DeadlineExceeded
+		outcome.stopped = !outcome.timedOut
 	}
+	return outcome
+}
 
+func (ph *ProviderHealth) applyCheckOutcome(doneCh <-chan struct{}, outcome providerHealthCheckOutcome) {
 	ph.mu.Lock()
-	if stopped {
-		if isClosed(doneCh) {
-			ph.clearActiveCheckLocked(doneCh)
-		}
-		ph.mu.Unlock()
+	defer ph.mu.Unlock()
+
+	if outcome.stopped {
+		ph.applyStoppedCheckLocked(doneCh)
 		return
 	}
-	ph.lastCheck = time.Now()
-	if timedOut {
+
+	checkedAt := time.Now()
+	ph.lastCheck = checkedAt
+	if outcome.timedOut {
 		if !isClosed(doneCh) {
 			ph.timedOutCheck = doneCh
 		} else {
@@ -351,9 +383,8 @@ func (ph *ProviderHealth) performCheck(ctx context.Context) {
 	} else if isClosed(doneCh) {
 		ph.clearActiveCheckLocked(doneCh)
 	}
-	defer ph.mu.Unlock()
 
-	if ok {
+	if outcome.ok {
 		ph.failureCount = 0
 		ph.isHealthy = true
 		return
@@ -362,8 +393,14 @@ func (ph *ProviderHealth) performCheck(ctx context.Context) {
 	ph.failureCount++
 	if ph.failureCount >= ph.maxFails {
 		ph.isHealthy = false
-		ph.cooldownUntil = time.Now().Add(ph.cooldownTime)
+		ph.cooldownUntil = checkedAt.Add(ph.cooldownTime)
 		ph.failureCount = 0 // reset for next cycle after cooldown
+	}
+}
+
+func (ph *ProviderHealth) applyStoppedCheckLocked(doneCh <-chan struct{}) {
+	if isClosed(doneCh) {
+		ph.clearActiveCheckLocked(doneCh)
 	}
 }
 

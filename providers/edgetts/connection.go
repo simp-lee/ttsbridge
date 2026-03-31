@@ -52,6 +52,11 @@ var unsupportedOutputFormatIndicators = []string{
 
 const handshakeErrorBodyReadLimit = 4096
 
+// maxResponseBodyReadBytes is a defense-in-depth limit for readResponseBody.
+// Current callers already pass io.LimitReader, but this prevents future callers
+// from accidentally reading unbounded responses.
+const maxResponseBodyReadBytes = 1 << 20 // 1 MB
+
 func hasClockSkewSignal(detail string) bool {
 	lower := strings.ToLower(strings.TrimSpace(detail))
 	if lower == "" {
@@ -104,14 +109,14 @@ func authFailedError(err error) error {
 	}
 }
 
-func classifyForbiddenResponse(serverDate, detail string) error {
+func (p *Provider) classifyForbiddenResponse(serverDate, detail string) error {
 	if !hasClockSkewSignal(detail) {
 		return authFailedError(nil)
 	}
 	if serverDate == "" {
 		return authFailedError(errors.New("clock skew indicated but server date header missing"))
 	}
-	if err := AdjustClockSkew(serverDate); err != nil {
+	if err := p.adjustClockSkew(serverDate); err != nil {
 		return authFailedError(fmt.Errorf("clock skew indicated but failed to parse server date: %w", err))
 	}
 	return &tts.Error{
@@ -125,23 +130,11 @@ func readResponseBody(body io.Reader) string {
 	if body == nil {
 		return ""
 	}
-	payload, err := io.ReadAll(body)
+	payload, err := io.ReadAll(io.LimitReader(body, maxResponseBodyReadBytes))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(payload))
-}
-
-func closeHandshakeResponseBody(resp *http.Response, maxBytes int64) string {
-	if resp == nil || resp.Body == nil {
-		return ""
-	}
-	var body string
-	if maxBytes > 0 {
-		body = readResponseBody(io.LimitReader(resp.Body, maxBytes))
-	}
-	closeIgnoreError(resp.Body)
-	return body
 }
 
 // connect establishes WebSocket connection with automatic clock skew handling.
@@ -156,7 +149,7 @@ func (p *Provider) connect(ctx context.Context) (*websocket.Conn, error) {
 
 	wsURL := fmt.Sprintf(wsURLTemplate,
 		baseURL, p.clientToken, generateConnectionID(),
-		GenerateSecMsGec(p.clientToken), secMsGecVersion)
+		p.generateSecMsGec(), secMsGecVersion)
 
 	dialOpts := &websocket.DialOptions{
 		HTTPHeader:   makeWSHeaders(),
@@ -174,20 +167,25 @@ func (p *Provider) connect(ctx context.Context) (*websocket.Conn, error) {
 	defer dialCancel()
 
 	conn, resp, err := websocketDial(dialCtx, wsURL, dialOpts)
+	if resp != nil && resp.Body != nil {
+		defer closeIgnoreError(resp.Body)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
 		// Clock skew detection and adjustment on 403 Forbidden
 		if resp != nil && resp.StatusCode == 403 {
-			responseBody := closeHandshakeResponseBody(resp, handshakeErrorBodyReadLimit)
+			responseBody := ""
+			if resp.Body != nil {
+				responseBody = readResponseBody(io.LimitReader(resp.Body, handshakeErrorBodyReadLimit))
+			}
 			detail := err.Error()
 			if responseBody != "" {
 				detail = strings.TrimSpace(detail + "\n" + responseBody)
 			}
-			return nil, classifyForbiddenResponse(resp.Header.Get("Date"), detail)
+			return nil, p.classifyForbiddenResponse(resp.Header.Get("Date"), detail)
 		}
-		closeHandshakeResponseBody(resp, 0)
 		return nil, &tts.Error{
 			Code:     tts.ErrCodeWebSocketError,
 			Message:  "websocket connection failed",
@@ -213,7 +211,7 @@ func makeWSHeaders() http.Header {
 }
 
 // sendConfig sends configuration message
-func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, allowUndeclaredProbeFormat bool) error {
+func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *synthesizeOptions, allowUndeclaredProbeFormat bool) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -257,7 +255,7 @@ func (p *Provider) sendConfig(ctx context.Context, conn *websocket.Conn, opts *S
 }
 
 // sendSSML sends SSML message
-func (p *Provider) sendSSML(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions) error {
+func (p *Provider) sendSSML(ctx context.Context, conn *websocket.Conn, opts *synthesizeOptions) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -285,65 +283,93 @@ func (p *Provider) sendSSML(ctx context.Context, conn *websocket.Conn, opts *Syn
 // receiveAudio receives audio data and handles metadata.
 // Boundary offsets are chunk-local. Callers should use ChunkIndex to rebuild a
 // cross-chunk timeline if needed.
-func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts *SynthesizeOptions, chunkIndex int) ([]byte, error) {
-	var audioData []byte
-	audioReceived := false
-	boundaryEmitted := false
-
+func (p *Provider) receiveAudio(ctx context.Context, conn *websocket.Conn, opts *synthesizeOptions, chunkIndex int) ([]byte, error) {
+	state := audioReceiveState{}
 	receiveTimeout := p.receiveTimeout
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 
-		readCtx, readCancel := context.WithTimeout(ctx, receiveTimeout)
-		messageType, message, err := conn.Read(readCtx)
-		readCancel()
+		messageType, message, err := readMessageWithTimeout(ctx, conn, receiveTimeout)
 		if err != nil {
-			// Normal closure without audio is an error
-			var ce websocket.CloseError
-			if errors.As(err, &ce) && ce.Code == websocket.StatusNormalClosure {
-				if !audioReceived {
-					if boundaryEmitted {
-						return nil, boundaryEmissionConflictError(err)
-					}
-					return nil, noAudioReceivedError()
-				}
-				return audioData, nil
-			}
-			if boundaryEmitted {
-				return nil, boundaryEmissionConflictError(err)
-			}
-			return nil, classifyWebsocketReadError(err, ctx.Err(), receiveTimeout, "websocket read error while receiving audio")
+			return handleReceiveAudioReadError(err, state, ctx.Err(), receiveTimeout)
 		}
 
-		switch messageType {
-		case websocket.MessageBinary:
-			if audioChunk := extractAudioData(message); len(audioChunk) > 0 {
-				audioData = append(audioData, audioChunk...)
-				audioReceived = true
-			}
-		case websocket.MessageText:
-			msg := string(message)
-			if opts.BoundaryCallback != nil && strings.Contains(msg, "Path:audio.metadata") {
-				if p.parseAndCallbackMetadata(message, opts.BoundaryCallback, chunkIndex) {
-					boundaryEmitted = true
-				}
-			}
-			if strings.Contains(msg, "Path:turn.end") {
-				if !audioReceived {
-					if boundaryEmitted {
-						return nil, boundaryEmissionConflictError(nil)
-					}
-					return nil, noAudioReceivedError()
-				}
-				return audioData, nil
-			}
+		turnEnded, err := p.handleReceiveAudioMessage(messageType, message, opts, chunkIndex, &state)
+		if err != nil {
+			return nil, err
+		}
+		if turnEnded {
+			return finishReceivedAudio(state, nil)
 		}
 	}
+}
+
+type audioReceiveState struct {
+	audioData       []byte
+	audioReceived   bool
+	boundaryEmitted bool
+}
+
+func readMessageWithTimeout(ctx context.Context, conn *websocket.Conn, receiveTimeout time.Duration) (websocket.MessageType, []byte, error) {
+	readCtx, readCancel := context.WithTimeout(ctx, receiveTimeout)
+	defer readCancel()
+	return conn.Read(readCtx)
+}
+
+func handleReceiveAudioReadError(err error, state audioReceiveState, parentCtxErr error, receiveTimeout time.Duration) ([]byte, error) {
+	var ce websocket.CloseError
+	if errors.As(err, &ce) && ce.Code == websocket.StatusNormalClosure {
+		return finishReceivedAudio(state, err)
+	}
+	if state.boundaryEmitted {
+		return nil, boundaryEmissionConflictError(err)
+	}
+	return nil, classifyWebsocketReadError(err, parentCtxErr, receiveTimeout, "websocket read error while receiving audio")
+}
+
+func (p *Provider) handleReceiveAudioMessage(messageType websocket.MessageType, message []byte, opts *synthesizeOptions, chunkIndex int, state *audioReceiveState) (bool, error) {
+	switch messageType {
+	case websocket.MessageBinary:
+		appendReceivedAudio(state, message)
+		return false, nil
+	case websocket.MessageText:
+		return p.handleReceiveAudioTextMessage(message, opts, chunkIndex, state)
+	default:
+		return false, nil
+	}
+}
+
+func appendReceivedAudio(state *audioReceiveState, message []byte) {
+	if audioChunk := extractAudioData(message); len(audioChunk) > 0 {
+		state.audioData = append(state.audioData, audioChunk...)
+		state.audioReceived = true
+	}
+}
+
+func (p *Provider) handleReceiveAudioTextMessage(message []byte, opts *synthesizeOptions, chunkIndex int, state *audioReceiveState) (bool, error) {
+	msg := string(message)
+	if opts.BoundaryCallback != nil && strings.Contains(msg, "Path:audio.metadata") {
+		if p.parseAndCallbackMetadata(message, opts.BoundaryCallback, chunkIndex) {
+			state.boundaryEmitted = true
+		}
+	}
+	if strings.Contains(msg, "Path:turn.end") {
+		return true, nil
+	}
+	return false, nil
+}
+
+func finishReceivedAudio(state audioReceiveState, err error) ([]byte, error) {
+	if state.audioReceived {
+		return state.audioData, nil
+	}
+	if state.boundaryEmitted {
+		return nil, boundaryEmissionConflictError(err)
+	}
+	return nil, noAudioReceivedError()
 }
 
 // parseAndCallbackMetadata parses metadata and invokes callback.

@@ -10,8 +10,38 @@ import (
 	"time"
 )
 
+func newDRMTestProvider() *Provider {
+	return &Provider{clientToken: defaultClientToken}
+}
+
+func resetDRMTimeNow(t *testing.T) func() {
+	t.Helper()
+	originalNow := drmTimeNow
+	return func() {
+		drmTimeNow = originalNow
+	}
+}
+
+func setDRMTestTime(now time.Time) {
+	drmTimeNow = func() time.Time { return now }
+}
+
+func expectedSkewFromRFC1123(t *testing.T, serverDate string, clientTime time.Time, currentSkew float64) float64 {
+	t.Helper()
+
+	serverTime, err := time.Parse(time.RFC1123, serverDate)
+	if err != nil {
+		t.Fatalf("failed to parse server date %q: %v", serverDate, err)
+	}
+
+	clientUnix := float64(clientTime.Unix()) + float64(clientTime.Nanosecond())/sToNs + currentSkew
+	serverUnix := float64(serverTime.Unix()) + float64(serverTime.Nanosecond())/sToNs
+	return serverUnix - clientUnix
+}
+
 func TestGenerateSecMsGec(t *testing.T) {
-	token := GenerateSecMsGec(defaultClientToken)
+	p := newDRMTestProvider()
+	token := p.generateSecMsGec()
 
 	// Token should be 64 characters (SHA256 hex)
 	if len(token) != 64 {
@@ -27,32 +57,23 @@ func TestGenerateSecMsGec(t *testing.T) {
 	}
 
 	// Generate again should produce same result within 5-minute window
-	token2 := GenerateSecMsGec(defaultClientToken)
+	token2 := p.generateSecMsGec()
 	if token != token2 {
 		t.Errorf("Tokens generated within same time window should match")
 	}
 }
 
 func TestAdjustClockSkew(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	p := newDRMTestProvider()
 
 	// Test valid RFC 2616 date
-	err := AdjustClockSkew("Mon, 02 Jan 2006 15:04:05 GMT")
+	err := p.adjustClockSkew("Mon, 02 Jan 2006 15:04:05 GMT")
 	if err != nil {
 		t.Errorf("Failed to parse valid date: %v", err)
 	}
 
 	// Test invalid date
-	err = AdjustClockSkew("invalid date")
+	err = p.adjustClockSkew("invalid date")
 	if err == nil {
 		t.Error("Should fail for invalid date")
 	}
@@ -60,62 +81,54 @@ func TestAdjustClockSkew(t *testing.T) {
 
 // TestClockSkewCalculation verifies the clock skew calculation matches Python reference
 func TestClockSkewCalculation(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	defer resetDRMTimeNow(t)()
+	p := newDRMTestProvider()
 
-	// Test Case 1: Server time is ahead by 10 seconds
-	// Capture time atomically to avoid timing drift
-	now := time.Now().UTC()
-	serverTime := now.Add(10 * time.Second)
+	// Use whole-second fixtures because RFC1123 only preserves second precision.
+	baseClientTime := time.Date(2024, time.November, 11, 12, 34, 56, 0, time.UTC)
+	setDRMTestTime(baseClientTime)
+	serverTime := baseClientTime.Add(10 * time.Second)
 	serverDateStr := serverTime.Format(time.RFC1123)
+	expectedSkew := expectedSkewFromRFC1123(t, serverDateStr, baseClientTime, 0)
 
-	// Calculate expected skew manually
-	serverUnix := float64(serverTime.Unix()) + float64(serverTime.Nanosecond())/sToNs
-	clientUnix := float64(now.Unix()) + float64(now.Nanosecond())/sToNs
-	expectedSkew := serverUnix - clientUnix
-
-	err := AdjustClockSkew(serverDateStr)
+	err := p.adjustClockSkew(serverDateStr)
 	if err != nil {
 		t.Fatalf("Failed to adjust clock skew: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew1 := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew1 := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
-	// Skew should match expected (allowing 1s for RFC1123 second precision + timing variance)
-	if math.Abs(skew1-expectedSkew) > 1.0 {
+	if math.Abs(skew1-expectedSkew) > 1e-9 {
 		t.Errorf("Expected skew %.3fs, got %.3fs (diff: %.3fs)", expectedSkew, skew1, skew1-expectedSkew)
 	}
 
-	// Test Case 2: Cumulative adjustment
-	// Simulate server being 5 more seconds ahead from the adjusted client time
-	now2 := time.Now().UTC()
-	// Server is now 15s ahead of the *original* time, but 5s ahead of adjusted time
-	serverTime2 := now2.Add(time.Duration((skew1 + 5.0) * float64(time.Second)))
+	// Advance the raw client clock by 20s. With the previous 10s skew applied,
+	// the adjusted client time is base+30s, so a server date at base+35s should
+	// add exactly 5 more seconds of skew.
+	secondClientTime := baseClientTime.Add(20 * time.Second)
+	setDRMTestTime(secondClientTime)
+	serverTime2 := baseClientTime.Add(35 * time.Second)
 	serverDateStr2 := serverTime2.Format(time.RFC1123)
+	expectedAdditionalSkew := expectedSkewFromRFC1123(t, serverDateStr2, secondClientTime, skew1)
 
-	err = AdjustClockSkew(serverDateStr2)
+	err = p.adjustClockSkew(serverDateStr2)
 	if err != nil {
 		t.Fatalf("Failed to adjust clock skew second time: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew2 := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew2 := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
-	// The additional adjustment should be approximately 5s
 	additionalSkew := skew2 - skew1
-	if math.Abs(additionalSkew-5.0) > 1.0 {
-		t.Errorf("Expected additional skew ~5s, got %.3fs (total: %.3fs)", additionalSkew, skew2)
+	if math.Abs(additionalSkew-expectedAdditionalSkew) > 1e-9 {
+		t.Errorf("Expected additional skew %.3fs, got %.3fs (total: %.3fs)", expectedAdditionalSkew, additionalSkew, skew2)
+	}
+	expectedTotalSkew := expectedSkew + expectedAdditionalSkew
+	if math.Abs(skew2-expectedTotalSkew) > 1e-9 {
+		t.Errorf("Expected total skew %.3fs, got %.3fs", expectedTotalSkew, skew2)
 	}
 
 	t.Logf("First adjustment: %.6fs, Second adjustment: %.6fs, Total: %.6fs",
@@ -124,38 +137,25 @@ func TestClockSkewCalculation(t *testing.T) {
 
 // TestClockSkewNegative verifies negative clock skew (client ahead of server)
 func TestClockSkewNegative(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	defer resetDRMTimeNow(t)()
+	p := newDRMTestProvider()
 
-	// Server time is behind by 5 seconds
-	now := time.Now().UTC()
-	serverTime := now.Add(-5 * time.Second)
+	clientTime := time.Date(2024, time.November, 11, 12, 34, 56, 0, time.UTC)
+	setDRMTestTime(clientTime)
+	serverTime := clientTime.Add(-5 * time.Second)
 	serverDateStr := serverTime.Format(time.RFC1123)
+	expectedSkew := expectedSkewFromRFC1123(t, serverDateStr, clientTime, 0)
 
-	// Calculate expected skew
-	serverUnix := float64(serverTime.Unix()) + float64(serverTime.Nanosecond())/sToNs
-	clientUnix := float64(now.Unix()) + float64(now.Nanosecond())/sToNs
-	expectedSkew := serverUnix - clientUnix
-
-	err := AdjustClockSkew(serverDateStr)
+	err := p.adjustClockSkew(serverDateStr)
 	if err != nil {
 		t.Fatalf("Failed to adjust clock skew: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
-	// Skew should match expected (allowing 1s for RFC1123 precision)
-	if math.Abs(skew-expectedSkew) > 1.0 {
+	if math.Abs(skew-expectedSkew) > 1e-9 {
 		t.Errorf("Expected skew %.3fs, got %.3fs (diff: %.3fs)", expectedSkew, skew, skew-expectedSkew)
 	}
 
@@ -164,30 +164,22 @@ func TestClockSkewNegative(t *testing.T) {
 
 // TestGenerateSecMsGecWithSkew verifies token generation with clock skew
 func TestGenerateSecMsGecWithSkew(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	p := newDRMTestProvider()
 
 	// Set a known skew that will cross a 5-minute boundary
 	// Use 301 seconds (just over 5 minutes) to ensure different token
-	clockSkewMutex.Lock()
-	clockSkewSeconds = 301.0
-	clockSkewMutex.Unlock()
+	p.clockSkewMu.Lock()
+	p.clockSkewSecs = 301.0
+	p.clockSkewMu.Unlock()
 
-	token1 := GenerateSecMsGec(defaultClientToken)
+	token1 := p.generateSecMsGec()
 
 	// Token should be different from one generated without skew
-	clockSkewMutex.Lock()
-	clockSkewSeconds = 0.0
-	clockSkewMutex.Unlock()
+	p.clockSkewMu.Lock()
+	p.clockSkewSecs = 0.0
+	p.clockSkewMu.Unlock()
 
-	token2 := GenerateSecMsGec(defaultClientToken)
+	token2 := p.generateSecMsGec()
 
 	// Tokens should be different due to skew crossing 5-minute boundary
 	if token1 == token2 {
@@ -195,25 +187,25 @@ func TestGenerateSecMsGecWithSkew(t *testing.T) {
 	}
 
 	// Restore skew and verify token matches again
-	clockSkewMutex.Lock()
-	clockSkewSeconds = 301.0
-	clockSkewMutex.Unlock()
+	p.clockSkewMu.Lock()
+	p.clockSkewSecs = 301.0
+	p.clockSkewMu.Unlock()
 
-	token3 := GenerateSecMsGec(defaultClientToken)
+	token3 := p.generateSecMsGec()
 	if token1 != token3 {
 		t.Error("Token should match when same skew is restored")
 	}
 
 	// Test that small skew within same 5-minute window produces same token
-	clockSkewMutex.Lock()
-	clockSkewSeconds = 10.0
-	clockSkewMutex.Unlock()
-	token4 := GenerateSecMsGec(defaultClientToken)
+	p.clockSkewMu.Lock()
+	p.clockSkewSecs = 10.0
+	p.clockSkewMu.Unlock()
+	token4 := p.generateSecMsGec()
 
-	clockSkewMutex.Lock()
-	clockSkewSeconds = 20.0
-	clockSkewMutex.Unlock()
-	token5 := GenerateSecMsGec(defaultClientToken)
+	p.clockSkewMu.Lock()
+	p.clockSkewSecs = 20.0
+	p.clockSkewMu.Unlock()
+	token5 := p.generateSecMsGec()
 
 	// These should likely be the same (unless we're at a boundary)
 	// Just log the result, don't fail
@@ -225,42 +217,29 @@ func TestGenerateSecMsGecWithSkew(t *testing.T) {
 
 // TestClockSkewPrecision verifies sub-second precision is maintained
 func TestClockSkewPrecision(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	defer resetDRMTimeNow(t)()
+	p := newDRMTestProvider()
 
-	// Create a server time with sub-second precision
-	// Note: RFC1123 format only has second precision, so we lose sub-second info in the date string
-	now := time.Now().UTC()
-	serverTime := now.Add(10*time.Second + 123*time.Millisecond + 456*time.Microsecond)
+	clientTime := time.Date(2024, time.November, 11, 12, 34, 56, 789123000, time.UTC)
+	setDRMTestTime(clientTime)
+	serverTime := clientTime.Add(10*time.Second + 123*time.Millisecond + 456*time.Microsecond)
 	serverDateStr := serverTime.Format(time.RFC1123)
+	expectedSkew := expectedSkewFromRFC1123(t, serverDateStr, clientTime, 0)
 
-	// Calculate expected skew (will lose sub-second precision due to RFC1123 format)
-	serverTimeParsed, _ := time.Parse(time.RFC1123, serverDateStr)
-	expectedSkew := float64(serverTimeParsed.Unix()) - float64(now.Unix())
-
-	err := AdjustClockSkew(serverDateStr)
+	err := p.adjustClockSkew(serverDateStr)
 	if err != nil {
 		t.Fatalf("Failed to adjust clock skew: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
-	// Due to RFC1123 second precision and timing variance, allow 1s tolerance
-	if math.Abs(skew-expectedSkew) > 1.0 {
+	if math.Abs(skew-expectedSkew) > 1e-9 {
 		t.Errorf("Expected skew %.3fs, got %.3fs (diff: %.3fs)", expectedSkew, skew, skew-expectedSkew)
 	}
 
-	t.Logf("Clock skew: %.6fs (expected: %.3fs, due to RFC1123 second precision)", skew, expectedSkew)
+	t.Logf("Clock skew: %.6fs (expected: %.6fs with RFC1123 server precision)", skew, expectedSkew)
 }
 
 // TestClockSkewAlgorithmMatchesPython verifies our algorithm matches Python reference exactly
@@ -271,80 +250,80 @@ func TestClockSkewAlgorithmMatchesPython(t *testing.T) {
 	//     client_date = DRM.get_unix_timestamp()  # Uses already-adjusted time
 	//     DRM.adj_clock_skew_seconds(server_date_parsed - client_date)  # Cumulative adjustment
 
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	defer resetDRMTimeNow(t)()
+	p := newDRMTestProvider()
 
 	// Scenario: Multiple adjustments to simulate real-world clock drift corrections
+	baseClientTime := time.Date(2024, time.November, 11, 12, 34, 56, 0, time.UTC)
 
 	// First adjustment: Server ahead by 10s
-	t1_client := time.Now().UTC()
-	t1_server := t1_client.Add(10 * time.Second)
-	err := AdjustClockSkew(t1_server.Format(time.RFC1123))
+	t1Client := baseClientTime
+	setDRMTestTime(t1Client)
+	t1Server := t1Client.Add(10 * time.Second)
+	t1ServerDate := t1Server.Format(time.RFC1123)
+	expectedDelta1 := expectedSkewFromRFC1123(t, t1ServerDate, t1Client, 0)
+	err := p.adjustClockSkew(t1ServerDate)
 	if err != nil {
 		t.Fatalf("First adjustment failed: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew1 := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew1 := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
+	if math.Abs(skew1-expectedDelta1) > 1e-9 {
+		t.Fatalf("Expected first skew %.3fs, got %.3fs", expectedDelta1, skew1)
+	}
 
 	t.Logf("After 1st adjustment: skew=%.6fs", skew1)
 
 	// Second adjustment: Server is now 3s ahead of the *adjusted* client time
-	time.Sleep(50 * time.Millisecond) // Small delay to simulate real request
-	t2_client := time.Now().UTC()
-	// Server time should be: current_time + current_skew + 3s
-	t2_server := t2_client.Add(time.Duration((skew1 + 3.0) * float64(time.Second)))
-	err = AdjustClockSkew(t2_server.Format(time.RFC1123))
+	t2Client := baseClientTime.Add(20 * time.Second)
+	setDRMTestTime(t2Client)
+	t2Server := baseClientTime.Add(33 * time.Second)
+	t2ServerDate := t2Server.Format(time.RFC1123)
+	expectedDelta2 := expectedSkewFromRFC1123(t, t2ServerDate, t2Client, skew1)
+	err = p.adjustClockSkew(t2ServerDate)
 	if err != nil {
 		t.Fatalf("Second adjustment failed: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew2 := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew2 := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
 	delta := skew2 - skew1
 	t.Logf("After 2nd adjustment: skew=%.6fs (delta=%.6fs)", skew2, delta)
 
-	// The delta should be approximately 3s (allowing for RFC1123 precision + timing)
-	if math.Abs(delta-3.0) > 1.0 {
-		t.Errorf("Expected delta ~3s, got %.3fs", delta)
+	if math.Abs(delta-expectedDelta2) > 1e-9 {
+		t.Errorf("Expected delta %.3fs, got %.3fs", expectedDelta2, delta)
 	}
 
 	// Third adjustment: Server falls behind by 2s from adjusted time (negative adjustment)
-	time.Sleep(50 * time.Millisecond)
-	t3_client := time.Now().UTC()
-	t3_server := t3_client.Add(time.Duration((skew2 - 2.0) * float64(time.Second)))
-	err = AdjustClockSkew(t3_server.Format(time.RFC1123))
+	t3Client := baseClientTime.Add(40 * time.Second)
+	setDRMTestTime(t3Client)
+	t3Server := baseClientTime.Add(51 * time.Second)
+	t3ServerDate := t3Server.Format(time.RFC1123)
+	expectedDelta3 := expectedSkewFromRFC1123(t, t3ServerDate, t3Client, skew2)
+	err = p.adjustClockSkew(t3ServerDate)
 	if err != nil {
 		t.Fatalf("Third adjustment failed: %v", err)
 	}
 
-	clockSkewMutex.RLock()
-	skew3 := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	skew3 := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
 	delta2 := skew3 - skew2
 	t.Logf("After 3rd adjustment: skew=%.6fs (delta=%.6fs)", skew3, delta2)
 
-	// The delta should be approximately -2s
-	if math.Abs(delta2+2.0) > 1.0 {
-		t.Errorf("Expected delta ~-2s, got %.3fs", delta2)
+	if math.Abs(delta2-expectedDelta3) > 1e-9 {
+		t.Errorf("Expected delta %.3fs, got %.3fs", expectedDelta3, delta2)
 	}
 
-	t.Logf("Final cumulative skew: %.6fs (expected ~11s)", skew3)
-	// Total should be approximately 10 + 3 - 2 = 11s
-	if math.Abs(skew3-11.0) > 1.5 {
-		t.Errorf("Expected total skew ~11s, got %.3fs", skew3)
+	expectedTotalSkew := expectedDelta1 + expectedDelta2 + expectedDelta3
+	t.Logf("Final cumulative skew: %.6fs (expected %.6fs)", skew3, expectedTotalSkew)
+	if math.Abs(skew3-expectedTotalSkew) > 1e-9 {
+		t.Errorf("Expected total skew %.3fs, got %.3fs", expectedTotalSkew, skew3)
 	}
 }
 
@@ -383,8 +362,9 @@ func TestTokenGenerationAlgorithm(t *testing.T) {
 	// Now generate with our implementation
 	// We need to mock time, but since we can't easily do that, we'll verify the algorithm
 	// by using the same manual calculation
+	p := newDRMTestProvider()
 	now := time.Now().UTC()
-	token := GenerateSecMsGec(defaultClientToken)
+	token := p.generateSecMsGec()
 
 	t.Logf("Current time: %s", now.Format(time.RFC3339Nano))
 	t.Logf("Generated token: %s", token)
@@ -403,24 +383,15 @@ func TestTokenGenerationAlgorithm(t *testing.T) {
 
 // TestEdgeCaseBoundaries tests token generation near 5-minute boundaries
 func TestEdgeCaseBoundaries(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	p := newDRMTestProvider()
 
 	// Generate token
-	token1 := GenerateSecMsGec(defaultClientToken)
+	token1 := p.generateSecMsGec()
 
 	// Wait to potentially cross boundary
 	time.Sleep(100 * time.Millisecond)
 
-	token2 := GenerateSecMsGec(defaultClientToken)
+	token2 := p.generateSecMsGec()
 
 	// Within 100ms, we should still be in the same 5-minute window
 	if token1 != token2 {
@@ -466,18 +437,9 @@ func TestRFC1123DateFormats(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Save and restore skew
-			clockSkewMutex.Lock()
-			originalSkew := clockSkewSeconds
-			clockSkewSeconds = 0
-			clockSkewMutex.Unlock()
-			defer func() {
-				clockSkewMutex.Lock()
-				clockSkewSeconds = originalSkew
-				clockSkewMutex.Unlock()
-			}()
+			p := newDRMTestProvider()
 
-			err := AdjustClockSkew(tc.dateStr)
+			err := p.adjustClockSkew(tc.dateStr)
 			if tc.shouldErr && err == nil {
 				t.Errorf("Expected error for date '%s', got nil", tc.dateStr)
 			} else if !tc.shouldErr && err != nil {
@@ -489,19 +451,10 @@ func TestRFC1123DateFormats(t *testing.T) {
 
 // TestZeroSkewBehavior verifies behavior with zero clock skew
 func TestZeroSkewBehavior(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	p := newDRMTestProvider()
 
 	// Generate token with zero skew
-	token := GenerateSecMsGec(defaultClientToken)
+	token := p.generateSecMsGec()
 
 	// Verify it's a valid SHA256 hash
 	if len(token) != 64 {
@@ -521,15 +474,7 @@ func TestZeroSkewBehavior(t *testing.T) {
 
 // TestConcurrentTokenGeneration tests thread safety of token generation
 func TestConcurrentTokenGeneration(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	p := newDRMTestProvider()
 
 	const numGoroutines = 100
 	tokens := make(chan string, numGoroutines)
@@ -537,7 +482,7 @@ func TestConcurrentTokenGeneration(t *testing.T) {
 	// Generate tokens concurrently
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			token := GenerateSecMsGec(defaultClientToken)
+			token := p.generateSecMsGec()
 			tokens <- token
 		}()
 	}
@@ -563,16 +508,11 @@ func TestConcurrentTokenGeneration(t *testing.T) {
 
 // TestConcurrentSkewAdjustment tests thread safety of skew adjustment
 func TestConcurrentSkewAdjustment(t *testing.T) {
-	// Save and restore original skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = 0
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	defer resetDRMTimeNow(t)()
+	p := newDRMTestProvider()
+
+	baseClientTime := time.Date(2024, time.November, 11, 12, 34, 56, 0, time.UTC)
+	setDRMTestTime(baseClientTime)
 
 	const numGoroutines = 50
 	done := make(chan bool, numGoroutines)
@@ -580,9 +520,8 @@ func TestConcurrentSkewAdjustment(t *testing.T) {
 	// Perform concurrent adjustments
 	for i := 0; i < numGoroutines; i++ {
 		go func(iteration int) {
-			now := time.Now().UTC()
-			serverTime := now.Add(time.Duration(iteration) * time.Second)
-			err := AdjustClockSkew(serverTime.Format(time.RFC1123))
+			serverTime := baseClientTime.Add(time.Duration(iteration+1) * time.Second)
+			err := p.adjustClockSkew(serverTime.Format(time.RFC1123))
 			if err != nil {
 				t.Errorf("Adjustment failed: %v", err)
 			}
@@ -595,15 +534,14 @@ func TestConcurrentSkewAdjustment(t *testing.T) {
 		<-done
 	}
 
-	clockSkewMutex.RLock()
-	finalSkew := clockSkewSeconds
-	clockSkewMutex.RUnlock()
+	p.clockSkewMu.RLock()
+	finalSkew := p.clockSkewSecs
+	p.clockSkewMu.RUnlock()
 
 	t.Logf("Final skew after %d concurrent adjustments: %.6fs", numGoroutines, finalSkew)
 
-	// Skew should be non-zero (accumulated from all adjustments)
-	if finalSkew == 0 {
-		t.Error("Expected non-zero skew after adjustments")
+	if finalSkew < 1.0 || finalSkew > float64(numGoroutines) {
+		t.Errorf("Expected final skew to match one of the deterministic server offsets [1,%d], got %.3fs", numGoroutines, finalSkew)
 	}
 }
 
@@ -622,18 +560,12 @@ func TestLargeSkewValues(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Save and restore original skew
-			clockSkewMutex.Lock()
-			originalSkew := clockSkewSeconds
-			clockSkewSeconds = tc.skew
-			clockSkewMutex.Unlock()
-			defer func() {
-				clockSkewMutex.Lock()
-				clockSkewSeconds = originalSkew
-				clockSkewMutex.Unlock()
-			}()
+			p := newDRMTestProvider()
+			p.clockSkewMu.Lock()
+			p.clockSkewSecs = tc.skew
+			p.clockSkewMu.Unlock()
 
-			token := GenerateSecMsGec(defaultClientToken)
+			token := p.generateSecMsGec()
 
 			// Verify token is valid
 			if len(token) != 64 {
@@ -733,16 +665,10 @@ func TestGenerateConnectionID(t *testing.T) {
 func TestGenerateSecMsGecMatchesReference(t *testing.T) {
 	const skew = 123.456789
 
-	// Preserve existing skew
-	clockSkewMutex.Lock()
-	originalSkew := clockSkewSeconds
-	clockSkewSeconds = skew
-	clockSkewMutex.Unlock()
-	defer func() {
-		clockSkewMutex.Lock()
-		clockSkewSeconds = originalSkew
-		clockSkewMutex.Unlock()
-	}()
+	p := newDRMTestProvider()
+	p.clockSkewMu.Lock()
+	p.clockSkewSecs = skew
+	p.clockSkewMu.Unlock()
 
 	referenceToken := func(unixSeconds int64) string {
 		ticks := float64(unixSeconds) + skew + winEpoch
@@ -758,7 +684,7 @@ func TestGenerateSecMsGecMatchesReference(t *testing.T) {
 
 	for attempt := 0; attempt < 5; attempt++ {
 		base := time.Now().Unix()
-		token := GenerateSecMsGec(defaultClientToken)
+		token := p.generateSecMsGec()
 
 		if token == referenceToken(base) || token == referenceToken(base+1) {
 			return
@@ -771,4 +697,28 @@ func TestGenerateSecMsGecMatchesReference(t *testing.T) {
 	}
 
 	t.Fatalf("token mismatch: got %s, expected %s (base=%d) or %s (base+1)", lastToken, referenceToken(lastBase), lastBase, referenceToken(lastBase+1))
+}
+
+// TestPerInstanceClockSkewIsolation verifies that clock skew is isolated per Provider instance
+func TestPerInstanceClockSkewIsolation(t *testing.T) {
+	p1 := newDRMTestProvider()
+	p2 := newDRMTestProvider()
+
+	p1.clockSkewMu.Lock()
+	p1.clockSkewSecs = 301.0
+	p1.clockSkewMu.Unlock()
+
+	// p2 should still have zero skew
+	p2.clockSkewMu.RLock()
+	if p2.clockSkewSecs != 0 {
+		t.Errorf("p2 skew = %f, want 0 (should be independent of p1)", p2.clockSkewSecs)
+	}
+	p2.clockSkewMu.RUnlock()
+
+	// Tokens should differ since skew differs
+	token1 := p1.generateSecMsGec()
+	token2 := p2.generateSecMsGec()
+	if token1 == token2 {
+		t.Error("Tokens from providers with different skew should differ")
+	}
 }

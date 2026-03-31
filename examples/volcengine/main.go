@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/simp-lee/ttsbridge/providers/volcengine"
 	"github.com/simp-lee/ttsbridge/tts"
@@ -33,7 +34,7 @@ func main() {
 
 // listVoices 列出所有可用语音
 func listVoices(ctx context.Context, provider *volcengine.Provider) {
-	voices, err := provider.ListVoices(ctx, "")
+	voices, err := provider.ListVoices(ctx, tts.VoiceFilter{})
 	if err != nil {
 		log.Printf("获取语音列表失败: %v", err)
 		return
@@ -50,9 +51,23 @@ func listVoices(ctx context.Context, provider *volcengine.Provider) {
 	for locale, voiceList := range locales {
 		fmt.Printf("\n【%s】 (%d 个)\n", locale, len(voiceList))
 		for _, v := range voiceList {
-			fmt.Printf("  - %s (%s) [%s]\n", v.Name, v.Gender, v.ID)
+			fmt.Printf("  - %s (%s) [%s] 语言: %s\n", v.Name, v.Gender, v.ID, formatLanguages(v))
 		}
 	}
+}
+
+func formatLanguages(voice tts.Voice) string {
+	languages := voice.Languages
+	if len(languages) == 0 {
+		languages = []tts.Language{voice.Language}
+	}
+
+	parts := make([]string, len(languages))
+	for i, language := range languages {
+		parts[i] = string(language)
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 // testAll21Voices 测试所有21款免费音色
@@ -114,12 +129,13 @@ func testAll21Voices(ctx context.Context, provider *volcengine.Provider) {
 
 		fmt.Printf("%2d. 测试 %s (%s)... ", i+1, tv.name, tv.id)
 
-		opts := &volcengine.SynthesizeOptions{
-			Text:  tv.text,
-			Voice: tv.id,
+		request := tts.SynthesisRequest{
+			InputMode: tts.InputModePlainText,
+			Text:      tv.text,
+			VoiceID:   tv.id,
 		}
 
-		audio, err := provider.Synthesize(ctx, opts)
+		result, err := provider.Synthesize(ctx, request)
 		if err != nil {
 			fmt.Printf("✗ 失败: %v\n", err)
 			failCount++
@@ -127,15 +143,15 @@ func testAll21Voices(ctx context.Context, provider *volcengine.Provider) {
 		}
 
 		// 保存音频文件
-		outputFile := fmt.Sprintf("voice_%02d_%s.mp3", i+1, tv.id)
-		if err := os.WriteFile(outputFile, audio, 0644); err != nil {
+		outputFile := fmt.Sprintf("voice_%02d_%s.%s", i+1, tv.id, result.Format)
+		if err := os.WriteFile(outputFile, result.Audio, 0o600); err != nil {
 			fmt.Printf("✗ 保存失败: %v\n", err)
 			failCount++
 			continue
 		}
 
-		totalSize += len(audio)
-		fmt.Printf("✓ 成功 (%d bytes)\n", len(audio))
+		totalSize += len(result.Audio)
+		fmt.Printf("✓ 成功 (%d bytes, format=%s)\n", len(result.Audio), result.Format)
 		successCount++
 	}
 

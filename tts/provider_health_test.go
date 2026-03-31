@@ -116,7 +116,7 @@ func TestProviderHealth_Start_ImmediateCheck(t *testing.T) {
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	// Give the goroutine a moment to run the immediate check
 	time.Sleep(50 * time.Millisecond)
@@ -142,7 +142,7 @@ func TestProviderHealth_FailureCountAndCooldown(t *testing.T) {
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	// Wait enough for immediate + 3 ticks (to hit maxFails)
 	time.Sleep(120 * time.Millisecond)
@@ -174,7 +174,7 @@ func TestProviderHealth_SuccessResetsFailureCount(t *testing.T) {
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	// Wait for a few checks to complete
 	time.Sleep(100 * time.Millisecond)
@@ -204,7 +204,7 @@ func TestProviderHealth_CooldownRecovery(t *testing.T) {
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	// Wait for failures + cooldown entry
 	time.Sleep(100 * time.Millisecond)
@@ -397,7 +397,7 @@ func TestProviderHealth_StartNilContext(t *testing.T) {
 		WithCheckInterval(time.Hour),
 	)
 
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	mustStartProviderHealth(t, ph, nilContextForTest())
 	time.Sleep(50 * time.Millisecond)
@@ -438,7 +438,10 @@ func TestProviderHealth_ConcurrentStartStop_NoDeadlock(t *testing.T) {
 						return
 					}
 				} else {
-					ph.Stop()
+					if stopErr := ph.Stop(); stopErr != nil {
+						t.Errorf("Stop() unexpected error = %v", stopErr)
+						return
+					}
 				}
 			}
 		}(i)
@@ -456,7 +459,7 @@ func TestProviderHealth_ConcurrentStartStop_NoDeadlock(t *testing.T) {
 		t.Fatal("concurrent Start/Stop did not finish in time")
 	}
 
-	ph.Stop()
+	mustStopProviderHealth(t, ph)
 }
 
 func TestProviderHealth_ConcurrentStop_IsSafe(t *testing.T) {
@@ -573,7 +576,7 @@ func TestProviderHealth_CheckTimeout_AllowsNextCycleAfterBlockingChecker(t *test
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	waitForCondition(t, 120*time.Millisecond, "checker to run at least twice after timeout", func() bool {
 		return calls.Load() >= 2
@@ -595,7 +598,8 @@ func TestProviderHealth_CheckTimeout_NoCheckerPileupWhenCheckerIgnoresCancel(t *
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
+	defer close(hang)
 
 	waitForCondition(t, 80*time.Millisecond, "checker to be marked stuck after timeout", func() bool {
 		ph.mu.RLock()
@@ -633,7 +637,7 @@ func TestProviderHealth_CheckTimeout_DelayedCancelCleanupDoesNotLatchStuck(t *te
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	waitForCondition(t, 80*time.Millisecond, "initial timed out check to mark provider unhealthy", func() bool {
 		return !ph.IsHealthy()
@@ -678,7 +682,8 @@ func TestProviderHealth_CheckTimeout_MarksUnhealthyWhenCheckerStaysStuck(t *test
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
+	defer close(hang)
 
 	select {
 	case <-started:
@@ -712,7 +717,7 @@ func TestProviderHealth_CheckTimeout_StuckCheckerRequiresRestart(t *testing.T) {
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	waitForCondition(t, 80*time.Millisecond, "stuck checker to mark provider unhealthy", func() bool {
 		return !ph.IsHealthy()
@@ -765,7 +770,7 @@ func TestProviderHealth_StartDoesNotOverlapStillStuckTimedOutChecker(t *testing.
 	)
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	select {
 	case <-firstCallStarted:
@@ -866,7 +871,7 @@ func TestProviderHealth_StartDoesNotOverlapStillRunningStoppedChecker(t *testing
 	}
 
 	mustStartProviderHealth(t, ph, context.Background())
-	defer ph.Stop()
+	defer mustStopProviderHealth(t, ph)
 
 	waitForCondition(t, 80*time.Millisecond, "restart after stopped checker exit", func() bool {
 		return calls.Load() >= 2

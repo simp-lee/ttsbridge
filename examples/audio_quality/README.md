@@ -1,89 +1,74 @@
 # 音频质量选择示例
 
-本示例展示如何使用 TTS Bridge 的 OutputOptions API 查看 Provider 的推荐格式目录，并在需要时通过显式 probe 确认当前环境已验证可用的格式。
+本示例只展示统一的输出能力 contract：
 
-## 设计理念
+1. 读取 provider.Capabilities() 查看共享输出能力
+2. 使用 tts.SynthesisRequest.OutputFormat 选择最终输出容器
+3. 观察不支持格式在本地能力校验阶段的 fail-fast 行为
 
-不同 TTS Provider 支持的输出格式数量和种类各不相同，无法用统一的"质量等级"枚举覆盖。
-因此本库采用 **目录 + 显式验证** 模式：
+## 设计原则
 
-1. 每个 Provider 通过 `OutputOptions()` 方法返回稳定的推荐格式目录
-2. 每个 `OutputOption` 包含 `FormatID`、可读标签、描述、音频特征（Profile）
-3. 如需确认当前环境中真正已验证可用的格式，调用 `FormatRegistry().ProbeAll(ctx)` 后再查看 `SupportedFormats()`
-4. 用户选择 `FormatID` 传入 `SynthesizeOptions.OutputFormat` 即可
+调用方只依赖统一 capability 模型：
 
-## 各 Provider 支持的格式
+1. SupportedFormats 表示当前 provider 通过统一请求可成功返回的输出格式
+2. PreferredAudioFormat 表示默认输出格式
+3. tts.SynthesisRequest.OutputFormat 用于显式选择最终输出容器
+
+provider-native 的格式目录、探测缓存和内部映射不属于 caller-facing contract，不应作为上层格式发现入口。
+
+## 当前共享输出能力
 
 ### EdgeTTS
 
-| FormatID | 标签 | 描述 |
-|----------|------|------|
-| `audio-24khz-48kbitrate-mono-mp3` | MP3 24kHz 48kbps | 默认格式，最小文件体积 |
-| `audio-24khz-96kbitrate-mono-mp3` | MP3 24kHz 96kbps | 平衡音质与体积 |
-| `audio-48khz-192kbitrate-mono-mp3` | MP3 48kHz 192kbps | 高音质，适合播客/视频配音 |
-| `audio-48khz-320kbitrate-mono-mp3` | MP3 48kHz 320kbps | 最高 MP3 音质 |
-| `raw-24khz-16bit-mono-pcm` | PCM 24kHz 无损 | 无损音频，适合存档/后期加工 |
+- SupportedFormats: mp3
+- PreferredAudioFormat: mp3
 
-> EdgeTTS 还有其他输出格式常量（如 Opus、Webm 等），也可直接传入 `OutputFormat` 使用。
-> `OutputOptions()` 列出的是推荐目录项，不等于当前环境已经验证通过的格式列表。
+当前 live Edge 服务只对共享层声明 mp3。请求 wav 或 pcm 会在能力校验阶段返回 UNSUPPORTED_FORMAT。
 
 ### Volcengine
 
-| FormatID | 标签 | 描述 |
-|----------|------|------|
-| `wav-24khz-16bit-mono` | WAV 24kHz 无损 | 固定输出，不可更改 |
+- SupportedFormats: wav
+- PreferredAudioFormat: wav
+
+Volcengine 免费 API 固定返回 WAV 24kHz 16-bit 单声道无损音频，不支持切换。
 
 ## 使用示例
 
-### 1. 查询推荐格式目录
+### 1. 查询共享输出能力
 
 ```go
-provider := edgetts.New()
+edgeCaps := edgetts.New().Capabilities()
+fmt.Println(edgeCaps.SupportedFormats, edgeCaps.PreferredAudioFormat)
 
-for _, opt := range provider.OutputOptions() {
-    fmt.Printf("%-45s %-25s %s\n", opt.FormatID, opt.Label, opt.Description)
-}
+volcCaps := volcengine.New().Capabilities()
+fmt.Println(volcCaps.SupportedFormats, volcCaps.PreferredAudioFormat)
 ```
 
-### 2. 显式 probe 当前环境已验证格式
+### 2. 使用统一请求选择输出格式
 
 ```go
-registry := provider.FormatRegistry()
-_, _, err := registry.ProbeAll(ctx)
-if err != nil {
-    log.Fatal(err)
-}
-
-for _, format := range provider.SupportedFormats() {
-    fmt.Println("verified:", format.ID)
-}
-```
-
-### 3. 选择输出格式
-
-```go
-opts := &edgetts.SynthesizeOptions{
+result, err := provider.Synthesize(ctx, tts.SynthesisRequest{
+    InputMode:    tts.InputModePlainText,
     Text:         "这是测试文本",
-    Voice:        "zh-CN-XiaoxiaoNeural",
-    OutputFormat: edgetts.OutputFormatMP3_48khz_192k, // 从 OutputOptions() 中选择
-}
-
-audio, err := provider.Synthesize(ctx, opts)
+    VoiceID:      "zh-CN-XiaoxiaoNeural",
+    OutputFormat: tts.AudioFormatMP3,
+})
 ```
 
-不设置 `OutputFormat` 时使用 Provider 默认格式。
+不设置 OutputFormat 时使用 provider.Capabilities().PreferredAudioFormat 对应的默认格式。
 
-### 4. OutputOption 结构体字段
+### 3. 验证不支持格式的 fail-fast
 
 ```go
-type OutputOption struct {
-    FormatID    string            // 传入 SynthesizeOptions.OutputFormat 的标识符
-    Label       string            // 人类可读的短标签
-    Description string            // 使用场景说明
-    Profile     VoiceAudioProfile // 音频特征（编码格式、采样率、声道数、比特率等）
-    IsDefault   bool              // 是否为默认格式
-}
+_, err := provider.Synthesize(ctx, tts.SynthesisRequest{
+    InputMode:    tts.InputModePlainText,
+    Text:         "这段文本不会发送到服务端",
+    VoiceID:      "zh-CN-XiaoxiaoNeural",
+    OutputFormat: tts.AudioFormatWAV,
+})
 ```
+
+对当前 live Edge provider，这个请求会在本地返回 UNSUPPORTED_FORMAT，而不是等服务端拒绝后再失败。
 
 ## 运行示例
 
@@ -102,15 +87,10 @@ go run main.go
 ffprobe -v error -show_entries stream=codec_name,bit_rate,sample_rate output.mp3
 ```
 
+### Q: EdgeTTS 为什么不能通过统一请求拿到 WAV 或 PCM？
+
+因为当前 live Edge 服务的 caller-facing 共享能力只声明 mp3。库会在本地先做 capability 校验，避免把明知不支持的格式请求发到服务端。
+
 ### Q: Volcengine 为什么只有一个格式？
 
 Volcengine 免费 API 始终输出固定的 WAV 24kHz 16-bit 无损音频，不支持切换。
-
-### Q: `OutputOptions()` 返回的格式是不是都已经验证可用？
-
-不是。`OutputOptions()` 是推荐目录面，便于展示和选择；当前环境里的真实可用性需要通过 `FormatRegistry().ProbeAll(ctx)` 后再看 `SupportedFormats()`。
-
-### Q: Provider 还有 `OutputOptions()` 之外的格式可用吗？
-
-EdgeTTS 有更多格式常量（如 `OutputFormatOpus_24khz`、`OutputFormatWebm_24khz` 等），
-可直接传入 `OutputFormat` 使用。`OutputOptions()` 列出的是推荐目录子集，不是实时验证结果。

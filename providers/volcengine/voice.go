@@ -16,7 +16,7 @@ type VoiceExtra struct {
 	SampleRate int    `json:"sample_rate"` // 24000 Hz
 
 	// 流式支持
-	SupportsStreaming bool `json:"supports_streaming"` // true
+	SupportsStreaming bool `json:"supports_streaming"` // false 表示无原生流式能力
 }
 
 // HasSceneTag 检查是否支持指定场景标签

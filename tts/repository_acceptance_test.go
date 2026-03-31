@@ -82,12 +82,12 @@ func walkRepositoryTextFiles(t *testing.T, root string, relPaths []string, visit
 				return nil
 			}
 
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				return err
+			walkRelPath, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				return relErr
 			}
 
-			visit(filepath.ToSlash(rel), readRepositoryFile(t, root, filepath.ToSlash(rel)))
+			visit(filepath.ToSlash(walkRelPath), readRepositoryFile(t, root, filepath.ToSlash(walkRelPath)))
 			return nil
 		})
 		if err != nil {
@@ -158,83 +158,7 @@ type exportedSymbol struct {
 func collectExportedSymbols(t *testing.T, root, relDir string) []exportedSymbol {
 	t.Helper()
 
-	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(relDir)))
-	if err != nil {
-		t.Fatalf("read package directory %s: %v", relDir, err)
-	}
-
-	fset := token.NewFileSet()
-	var symbols []exportedSymbol
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
-			continue
-		}
-
-		filePath := filepath.Join(root, filepath.FromSlash(relDir), entry.Name())
-		file, err := parser.ParseFile(fset, filePath, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatalf("parse %s: %v", filepath.ToSlash(filepath.Join(relDir, entry.Name())), err)
-		}
-
-		for _, decl := range file.Decls {
-			switch d := decl.(type) {
-			case *ast.GenDecl:
-				switch d.Tok {
-				case token.TYPE:
-					for _, spec := range d.Specs {
-						typeSpec, ok := spec.(*ast.TypeSpec)
-						if !ok || !ast.IsExported(typeSpec.Name.Name) {
-							continue
-						}
-						symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "type", Name: typeSpec.Name.Name})
-
-						switch typeNode := typeSpec.Type.(type) {
-						case *ast.StructType:
-							for _, field := range typeNode.Fields.List {
-								for _, name := range field.Names {
-									if ast.IsExported(name.Name) {
-										symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "field", Name: typeSpec.Name.Name + "." + name.Name})
-									}
-								}
-							}
-						case *ast.InterfaceType:
-							for _, field := range typeNode.Methods.List {
-								for _, name := range field.Names {
-									symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "method", Name: typeSpec.Name.Name + "." + name.Name})
-								}
-							}
-						}
-					}
-				case token.CONST, token.VAR:
-					for _, spec := range d.Specs {
-						valueSpec, ok := spec.(*ast.ValueSpec)
-						if !ok {
-							continue
-						}
-						for _, name := range valueSpec.Names {
-							if ast.IsExported(name.Name) {
-								symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: strings.ToLower(d.Tok.String()), Name: name.Name})
-							}
-						}
-					}
-				}
-			case *ast.FuncDecl:
-				if d.Recv == nil {
-					if ast.IsExported(d.Name.Name) {
-						symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "func", Name: d.Name.Name})
-					}
-					continue
-				}
-
-				receiver := receiverTypeName(d.Recv.List[0].Type)
-				if receiver != "" && ast.IsExported(receiver) && ast.IsExported(d.Name.Name) {
-					symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "method", Name: receiver + "." + d.Name.Name})
-				}
-			}
-		}
-	}
-
+	symbols := collectExportedPackageSymbols(t, root, relDir)
 	sort.Slice(symbols, func(i, j int) bool {
 		if symbols[i].PackageRel != symbols[j].PackageRel {
 			return symbols[i].PackageRel < symbols[j].PackageRel
@@ -246,6 +170,167 @@ func collectExportedSymbols(t *testing.T, root, relDir string) []exportedSymbol 
 	})
 
 	return symbols
+}
+
+func collectExportedPackageSymbols(t *testing.T, root, relDir string) []exportedSymbol {
+	t.Helper()
+
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(relDir)))
+	if err != nil {
+		t.Fatalf("read package directory %s: %v", relDir, err)
+	}
+
+	fset := token.NewFileSet()
+	symbols := make([]exportedSymbol, 0, len(entries))
+
+	for _, entry := range entries {
+		if !isNonTestGoDirEntry(entry) {
+			continue
+		}
+
+		file := parseGoFileOrFatal(t, fset, root, filepath.ToSlash(filepath.Join(relDir, entry.Name())), parser.SkipObjectResolution)
+		symbols = append(symbols, collectExportedSymbolsFromFile(relDir, file)...)
+	}
+
+	return symbols
+}
+
+func isNonTestGoDirEntry(entry fs.DirEntry) bool {
+	return !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") && !strings.HasSuffix(entry.Name(), "_test.go")
+}
+
+func parseGoFileOrFatal(t *testing.T, fset *token.FileSet, root, relPath string, mode parser.Mode) *ast.File {
+	t.Helper()
+
+	filePath := filepath.Join(root, filepath.FromSlash(relPath))
+	file, err := parser.ParseFile(fset, filePath, nil, mode)
+	if err != nil {
+		t.Fatalf("parse %s: %v", relPath, err)
+	}
+	return file
+}
+
+func collectExportedSymbolsFromFile(relDir string, file *ast.File) []exportedSymbol {
+	symbols := make([]exportedSymbol, 0, len(file.Decls))
+	for _, decl := range file.Decls {
+		symbols = append(symbols, collectExportedSymbolsFromDecl(relDir, decl)...)
+	}
+	return symbols
+}
+
+func collectExportedSymbolsFromDecl(relDir string, decl ast.Decl) []exportedSymbol {
+	switch d := decl.(type) {
+	case *ast.GenDecl:
+		return collectExportedSymbolsFromGenDecl(relDir, d)
+	case *ast.FuncDecl:
+		return collectExportedSymbolsFromFuncDecl(relDir, d)
+	default:
+		return nil
+	}
+}
+
+func collectExportedSymbolsFromGenDecl(relDir string, decl *ast.GenDecl) []exportedSymbol {
+	switch decl.Tok {
+	case token.TYPE:
+		var symbols []exportedSymbol
+		for _, spec := range decl.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			symbols = append(symbols, collectExportedSymbolsFromTypeSpec(relDir, typeSpec)...)
+		}
+		return symbols
+	case token.CONST, token.VAR:
+		var symbols []exportedSymbol
+		for _, spec := range decl.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			symbols = append(symbols, collectExportedSymbolsFromValueSpec(relDir, decl.Tok, valueSpec)...)
+		}
+		return symbols
+	default:
+		return nil
+	}
+}
+
+func collectExportedSymbolsFromTypeSpec(relDir string, typeSpec *ast.TypeSpec) []exportedSymbol {
+	if !ast.IsExported(typeSpec.Name.Name) {
+		return nil
+	}
+
+	typeName := typeSpec.Name.Name
+	symbols := []exportedSymbol{{PackageRel: relDir, Kind: "type", Name: typeName}}
+	return append(symbols, collectExportedMemberSymbols(relDir, typeName, typeSpec.Type)...)
+}
+
+func collectExportedMemberSymbols(relDir, typeName string, expr ast.Expr) []exportedSymbol {
+	switch node := expr.(type) {
+	case *ast.StructType:
+		return collectExportedStructFieldSymbols(relDir, typeName, node.Fields)
+	case *ast.InterfaceType:
+		return collectExportedInterfaceMethodSymbols(relDir, typeName, node.Methods)
+	default:
+		return nil
+	}
+}
+
+func collectExportedStructFieldSymbols(relDir, typeName string, fields *ast.FieldList) []exportedSymbol {
+	if fields == nil {
+		return nil
+	}
+
+	var symbols []exportedSymbol
+	for _, field := range fields.List {
+		for _, name := range field.Names {
+			if ast.IsExported(name.Name) {
+				symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "field", Name: typeName + "." + name.Name})
+			}
+		}
+	}
+	return symbols
+}
+
+func collectExportedInterfaceMethodSymbols(relDir, typeName string, methods *ast.FieldList) []exportedSymbol {
+	if methods == nil {
+		return nil
+	}
+
+	var symbols []exportedSymbol
+	for _, field := range methods.List {
+		for _, name := range field.Names {
+			symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: "method", Name: typeName + "." + name.Name})
+		}
+	}
+	return symbols
+}
+
+func collectExportedSymbolsFromValueSpec(relDir string, tok token.Token, spec *ast.ValueSpec) []exportedSymbol {
+	var symbols []exportedSymbol
+	for _, name := range spec.Names {
+		if ast.IsExported(name.Name) {
+			symbols = append(symbols, exportedSymbol{PackageRel: relDir, Kind: strings.ToLower(tok.String()), Name: name.Name})
+		}
+	}
+	return symbols
+}
+
+func collectExportedSymbolsFromFuncDecl(relDir string, decl *ast.FuncDecl) []exportedSymbol {
+	if decl.Recv == nil {
+		if ast.IsExported(decl.Name.Name) {
+			return []exportedSymbol{{PackageRel: relDir, Kind: "func", Name: decl.Name.Name}}
+		}
+		return nil
+	}
+
+	receiver := receiverTypeName(decl.Recv.List[0].Type)
+	if receiver == "" || !ast.IsExported(receiver) || !ast.IsExported(decl.Name.Name) {
+		return nil
+	}
+
+	return []exportedSymbol{{PackageRel: relDir, Kind: "method", Name: receiver + "." + decl.Name.Name}}
 }
 
 func collectExportedTopLevelTypeNames(t *testing.T, root, relDir string) []string {
@@ -315,54 +400,7 @@ func collectPublicLibraryPackages(t *testing.T, root string) []string {
 
 	packages := make(map[string]string)
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
-			}
-
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				return err
-			}
-			rel = filepath.ToSlash(rel)
-			if rel == "." {
-				return nil
-			}
-			if strings.HasPrefix(rel, "cmd/") || strings.HasPrefix(rel, "examples/") || strings.HasPrefix(rel, "internal/") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if !strings.HasSuffix(d.Name(), ".go") || strings.HasSuffix(d.Name(), "_test.go") {
-			return nil
-		}
-
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		dir := filepath.ToSlash(filepath.Dir(rel))
-		if dir == "." {
-			return nil
-		}
-
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, parser.PackageClauseOnly)
-		if err != nil {
-			return err
-		}
-		if file.Name.Name == "main" {
-			return nil
-		}
-
-		packages[dir] = file.Name.Name
-		return nil
+		return collectPublicLibraryPackageEntry(root, path, d, walkErr, packages)
 	})
 	if err != nil {
 		t.Fatalf("walk public packages: %v", err)
@@ -377,6 +415,80 @@ func collectPublicLibraryPackages(t *testing.T, root string) []string {
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+func collectPublicLibraryPackageEntry(root, path string, d fs.DirEntry, walkErr error, packages map[string]string) error {
+	if walkErr != nil {
+		return walkErr
+	}
+	if d.IsDir() {
+		return publicLibraryDirDecision(root, path, d.Name())
+	}
+	if !isNonTestGoSourceFile(d.Name()) {
+		return nil
+	}
+
+	rel, err := repositoryRelativePath(root, path)
+	if err != nil {
+		return err
+	}
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." {
+		return nil
+	}
+
+	pkgName, err := parsePackageName(path)
+	if err != nil {
+		return err
+	}
+	if pkgName == "main" {
+		return nil
+	}
+
+	packages[dir] = pkgName
+	return nil
+}
+
+func publicLibraryDirDecision(root, path, name string) error {
+	if strings.HasPrefix(name, ".") {
+		return filepath.SkipDir
+	}
+
+	rel, err := repositoryRelativePath(root, path)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	if isNonLibraryDirectory(rel) {
+		return filepath.SkipDir
+	}
+	return nil
+}
+
+func repositoryRelativePath(root, path string) (string, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+func isNonLibraryDirectory(rel string) bool {
+	return strings.HasPrefix(rel, "cmd/") || strings.HasPrefix(rel, "examples/") || strings.HasPrefix(rel, "internal/")
+}
+
+func isNonTestGoSourceFile(name string) bool {
+	return strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go")
+}
+
+func parsePackageName(path string) (string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly)
+	if err != nil {
+		return "", err
+	}
+	return file.Name.Name, nil
 }
 
 func receiverTypeName(expr ast.Expr) string {
@@ -526,6 +638,16 @@ func TestREADME_StatesLibraryAndCLIOnly(t *testing.T) {
 	}
 	if !strings.Contains(cliReadme, "go build -o ttsbridge ./cmd/ttsbridge") {
 		t.Fatal("CLI README no longer documents building the CLI binary")
+	}
+	for _, required := range []string{"SynthesisRequest", "SynthesisResult", "ProviderCapabilities", "VoiceFilter"} {
+		if !strings.Contains(readme, required) {
+			t.Fatalf("root README must document unified contract type %q", required)
+		}
+	}
+	for _, forbidden := range []string{"Provider[T]", "edgetts.SynthesizeOptions", "volcengine.SynthesizeOptions"} {
+		if strings.Contains(readme, forbidden) {
+			t.Fatalf("root README must not advertise legacy/provider-specific API fragment %q", forbidden)
+		}
 	}
 }
 
@@ -718,34 +840,58 @@ func TestCLIProviderAwareness_StaysConfinedToAdapterFiles(t *testing.T) {
 	}
 }
 
-// AC-11: CLI 应复用核心库能力，而不是复制另一套 provider 逻辑或配置模型。
-func TestCLIContracts_RemainSingleSourceProviderAgnosticAdapters(t *testing.T) {
+// AC-11: CLI 应直接复用统一 tts 契约，而不是复制另一套 request/result/capability 模型。
+func TestCLIContracts_ReuseUnifiedTTSContracts(t *testing.T) {
 	root := repositoryRoot(t)
 	internalCLITypes := collectExportedTopLevelTypeNames(t, root, "internal/cli")
 
-	var requestLikeTypes []string
-	for _, typeName := range internalCLITypes {
-		lower := strings.ToLower(typeName)
-		if strings.Contains(lower, "request") || strings.Contains(lower, "config") {
-			requestLikeTypes = append(requestLikeTypes, typeName)
+	for _, required := range []string{"ProviderConfig", "ProviderFactory", "ProviderRegistration"} {
+		if !stringSliceContains(internalCLITypes, required) {
+			t.Fatalf("expected internal/cli to retain %s for CLI-only provider wiring", required)
 		}
 	}
-	sort.Strings(requestLikeTypes)
-	wantRequestLikeTypes := []string{"ProviderConfig", "SynthesizeRequest"}
-	if strings.Join(requestLikeTypes, ",") != strings.Join(wantRequestLikeTypes, ",") {
-		t.Fatalf("internal/cli request-config type inventory = %v, want %v", requestLikeTypes, wantRequestLikeTypes)
+	for _, forbidden := range []string{"SynthesizeRequest", "SynthesisResult", "ProviderCapabilities", "Voice", "VoiceFilter"} {
+		if stringSliceContains(internalCLITypes, forbidden) {
+			t.Fatalf("internal/cli must not shadow unified core contract type %s", forbidden)
+		}
 	}
 
 	registrySource := readRepositoryFile(t, root, "internal/cli/registry.go")
-	if !strings.Contains(registrySource, "ListVoices(ctx context.Context, locale string) ([]tts.Voice, error)") {
-		t.Fatal("CLI adapter interface should reuse tts.Voice instead of introducing a CLI-specific voice model")
+	if !strings.Contains(registrySource, "type ProviderFactory func(cfg *ProviderConfig) (tts.Provider, error)") {
+		t.Fatal("CLI registry must create unified tts.Provider instances")
+	}
+	if !strings.Contains(registrySource, "type ProviderRegistration struct") {
+		t.Fatal("CLI registry must carry provider registration metadata instead of a bespoke adapter interface")
+	}
+	if strings.Contains(registrySource, "ListVoices(ctx context.Context, locale string)") {
+		t.Fatal("legacy locale-only adapter signature must not remain in CLI registry")
+	}
+
+	voicesSource := readRepositoryFile(t, root, "internal/cli/voices.go")
+	if !strings.Contains(voicesSource, "tts.VoiceFilter{Language: c.locale}") {
+		t.Fatal("voices command must translate CLI locale input into unified tts.VoiceFilter")
+	}
+
+	synthesizeSource := readRepositoryFile(t, root, "internal/cli/synthesize.go")
+	for _, required := range []string{"tts.SynthesisRequest{", "tts.ProsodyParams{"} {
+		if !strings.Contains(synthesizeSource, required) {
+			t.Fatalf("synthesize command must reuse unified core contract fragment %q", required)
+		}
 	}
 
 	walkRepositoryTextFiles(t, root, []string{"internal/cli"}, func(rel string, content string) {
 		if !strings.HasSuffix(rel, ".go") || strings.HasSuffix(rel, "_test.go") {
 			return
 		}
-		for _, forbidden := range []string{"type Voice struct", "type VoiceExtra struct", "type EdgeTTS", "type Volcengine"} {
+		for _, forbidden := range []string{
+			"type Voice struct",
+			"type VoiceExtra struct",
+			"type SynthesizeRequest struct",
+			"type SynthesisResult struct",
+			"type ProviderCapabilities struct",
+			"type EdgeTTS",
+			"type Volcengine",
+		} {
 			if strings.Contains(content, forbidden) {
 				t.Fatalf("CLI layer should not shadow provider/core data models; found %q in %s", forbidden, rel)
 			}
@@ -753,114 +899,156 @@ func TestCLIContracts_RemainSingleSourceProviderAgnosticAdapters(t *testing.T) {
 	})
 }
 
+var publicAPIPackages = []string{
+	"tts",
+	"tts/textutils",
+	"providers/edgetts",
+	"providers/volcengine",
+}
+
+var forbiddenBoundaryFragments = []string{
+	"backgroundmusic",
+	"background_music",
+	"mixer",
+	"mix",
+	"upload",
+	"webui",
+	"ffmpeg",
+	"ffprobe",
+	"cleanupoldfiles",
+	"supportedaudioextension",
+}
+
+var allowedCoreTypeDomains = map[string][]string{
+	"tts": {
+		"Language",
+		"Gender",
+		"Boundary",
+		"Voice",
+		"Synthesis",
+		"Prosody",
+		"Audio",
+		"Provider",
+		"Error",
+		"Format",
+		"Output",
+		"Health",
+		"Failure",
+		"Fallback",
+	},
+	"tts/textutils": {
+		"Split",
+		"Clean",
+	},
+}
+
 // AC-13: 核心库 API 设计必须保持简洁、准确、无冗余，避免为未确认需求预留多余抽象、包装层或配置层。
-func TestPublicAPI_SurfaceRemainsMinimalAndTTSFocused(t *testing.T) {
+func TestPublicAPI_PublicExportsAvoidForbiddenBoundaryConcepts(t *testing.T) {
 	root := repositoryRoot(t)
-	publicPackages := []string{
-		"tts",
-		"tts/textutils",
-		"providers/edgetts",
-		"providers/volcengine",
+	for _, relDir := range publicAPIPackages {
+		relDir := relDir
+		t.Run(strings.ReplaceAll(relDir, "/", "_"), func(t *testing.T) {
+			assertPublicExportsAvoidForbiddenFragments(t, root, relDir, forbiddenBoundaryFragments)
+		})
 	}
-	forbiddenBoundaryFragments := []string{
-		"backgroundmusic",
-		"background_music",
-		"mixer",
-		"mix",
-		"upload",
-		"webui",
-		"ffmpeg",
-		"ffprobe",
-		"cleanupoldfiles",
-		"supportedaudioextension",
+}
+
+func TestPublicAPI_ExportedTypesStayWithinApprovedDomains(t *testing.T) {
+	root := repositoryRoot(t)
+	for relDir, allowedFragments := range allowedCoreTypeDomains {
+		relDir := relDir
+		allowedFragments := allowedFragments
+		t.Run(strings.ReplaceAll(relDir, "/", "_"), func(t *testing.T) {
+			assertPublicTypesStayWithinDomains(t, root, relDir, allowedFragments)
+		})
 	}
-	allowedCoreTypeDomains := map[string][]string{
-		"tts": {
-			"Language",
-			"Gender",
-			"Boundary",
-			"Voice",
-			"Audio",
-			"Provider",
-			"Error",
-			"Format",
-			"Output",
-			"Health",
-			"Failure",
-			"Fallback",
-		},
-		"tts/textutils": {
-			"Split",
-			"Clean",
-		},
+}
+
+func assertPublicExportsAvoidForbiddenFragments(t *testing.T, root, relDir string, forbiddenFragments []string) {
+	t.Helper()
+
+	for _, symbol := range collectExportedSymbols(t, root, relDir) {
+		if lowerContainsAny(symbol.Name, forbiddenFragments) {
+			t.Fatalf("public %s %s in %s leaks removed boundary concepts", symbol.Kind, symbol.Name, relDir)
+		}
+	}
+}
+
+func assertPublicTypesStayWithinDomains(t *testing.T, root, relDir string, allowedFragments []string) {
+	t.Helper()
+
+	for _, typeName := range collectExportedTopLevelTypeNames(t, root, relDir) {
+		if !lowerContainsAny(typeName, allowedFragments) {
+			t.Fatalf("exported type %s in %s falls outside the approved TTS domains %v", typeName, relDir, allowedFragments)
+		}
+	}
+}
+
+func TestPublicAPI_CLIRequestAndConfigContractsRemainInternal(t *testing.T) {
+	root := repositoryRoot(t)
+	internalCLITypes := collectExportedTopLevelTypeNames(t, root, "internal/cli")
+	for _, internalName := range []string{"ProviderConfig", "ProviderFactory", "ProviderRegistration"} {
+		if !stringSliceContains(internalCLITypes, internalName) {
+			t.Fatalf("expected internal/cli to define %s for CLI-only adaptation", internalName)
+		}
+
+		for _, relDir := range publicAPIPackages {
+			publicTypes := collectExportedTopLevelTypeNames(t, root, relDir)
+			if stringSliceContains(publicTypes, internalName) {
+				t.Fatalf("public package %s must not expose CLI-only contract type %s", relDir, internalName)
+			}
+		}
+	}
+}
+
+func TestPublicAPI_UnifiedProviderContractReplacesGenericAPI(t *testing.T) {
+	root := repositoryRoot(t)
+	typesSource := readRepositoryFile(t, root, "tts/types.go")
+	if !strings.Contains(typesSource, "type Provider interface") {
+		t.Fatal("tts/types.go must expose a unified Provider interface")
+	}
+	for _, required := range []string{"type SynthesisRequest struct", "type SynthesisResult struct", "type ProviderCapabilities struct"} {
+		if !strings.Contains(typesSource, required) {
+			t.Fatalf("tts/types.go must define unified contract fragment %q", required)
+		}
+	}
+	for _, forbidden := range []string{"type Provider[T any]", "Provider[T]"} {
+		if strings.Contains(typesSource, forbidden) {
+			t.Fatalf("tts/types.go must not retain legacy generic provider fragment %q", forbidden)
+		}
+	}
+}
+
+func TestPublicAPI_ProviderPackagesDoNotExportLegacySynthesizeOptions(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, relDir := range []string{"providers/edgetts", "providers/volcengine"} {
+		publicTypes := collectExportedTopLevelTypeNames(t, root, relDir)
+		if stringSliceContains(publicTypes, "SynthesizeOptions") {
+			t.Fatalf("public package %s must not export legacy provider-specific SynthesizeOptions", relDir)
+		}
+	}
+}
+
+func TestPublicAPI_IntentionalTypeDuplicationStaysSmallAndExplicit(t *testing.T) {
+	root := repositoryRoot(t)
+	duplicates := collectDuplicateExportedTypeNamesByPackage(t, root, publicAPIPackages)
+	wantDuplicates := map[string][]string{
+		"Provider":   {"providers/edgetts", "providers/volcengine", "tts"},
+		"VoiceExtra": {"providers/edgetts", "providers/volcengine"},
 	}
 
-	t.Run("forbidden-boundary-concepts-stay-out-of-public-exports", func(t *testing.T) {
-		for _, relDir := range publicPackages {
-			relDir := relDir
-			t.Run(strings.ReplaceAll(relDir, "/", "_"), func(t *testing.T) {
-				symbols := collectExportedSymbols(t, root, relDir)
-				for _, symbol := range symbols {
-					if lowerContainsAny(symbol.Name, forbiddenBoundaryFragments) {
-						t.Fatalf("public %s %s in %s leaks removed boundary concepts", symbol.Kind, symbol.Name, relDir)
-					}
-				}
-			})
+	if len(duplicates) != len(wantDuplicates) {
+		t.Fatalf("duplicate exported public type names = %v, want %v", duplicates, wantDuplicates)
+	}
+	for typeName, wantOwners := range wantDuplicates {
+		gotOwners, ok := duplicates[typeName]
+		if !ok {
+			t.Fatalf("missing expected duplicate exported type %s in %v", typeName, duplicates)
 		}
-	})
-
-	t.Run("core-exported-types-stay-within-approved-domains", func(t *testing.T) {
-		for relDir, allowedFragments := range allowedCoreTypeDomains {
-			relDir := relDir
-			allowedFragments := allowedFragments
-			t.Run(strings.ReplaceAll(relDir, "/", "_"), func(t *testing.T) {
-				typeNames := collectExportedTopLevelTypeNames(t, root, relDir)
-				for _, typeName := range typeNames {
-					if !lowerContainsAny(typeName, allowedFragments) {
-						t.Fatalf("exported type %s in %s falls outside the approved TTS domains %v", typeName, relDir, allowedFragments)
-					}
-				}
-			})
+		if strings.Join(gotOwners, ",") != strings.Join(wantOwners, ",") {
+			t.Fatalf("duplicate owners for %s = %v, want %v", typeName, gotOwners, wantOwners)
 		}
-	})
-
-	t.Run("cli-request-and-config-contracts-remain-internal", func(t *testing.T) {
-		internalCLITypes := collectExportedTopLevelTypeNames(t, root, "internal/cli")
-		for _, internalName := range []string{"ProviderConfig", "SynthesizeRequest"} {
-			if !stringSliceContains(internalCLITypes, internalName) {
-				t.Fatalf("expected internal/cli to define %s for CLI-only adaptation", internalName)
-			}
-
-			for _, relDir := range publicPackages {
-				publicTypes := collectExportedTopLevelTypeNames(t, root, relDir)
-				if stringSliceContains(publicTypes, internalName) {
-					t.Fatalf("public package %s must not expose CLI-only contract type %s", relDir, internalName)
-				}
-			}
-		}
-	})
-
-	t.Run("intentional-type-duplication-stays-small-and-explicit", func(t *testing.T) {
-		duplicates := collectDuplicateExportedTypeNamesByPackage(t, root, publicPackages)
-		wantDuplicates := map[string][]string{
-			"Provider":          {"providers/edgetts", "providers/volcengine", "tts"},
-			"SynthesizeOptions": {"providers/edgetts", "providers/volcengine"},
-			"VoiceExtra":        {"providers/edgetts", "providers/volcengine"},
-		}
-
-		if len(duplicates) != len(wantDuplicates) {
-			t.Fatalf("duplicate exported public type names = %v, want %v", duplicates, wantDuplicates)
-		}
-		for typeName, wantOwners := range wantDuplicates {
-			gotOwners, ok := duplicates[typeName]
-			if !ok {
-				t.Fatalf("missing expected duplicate exported type %s in %v", typeName, duplicates)
-			}
-			if strings.Join(gotOwners, ",") != strings.Join(wantOwners, ",") {
-				t.Fatalf("duplicate owners for %s = %v, want %v", typeName, gotOwners, wantOwners)
-			}
-		}
-	})
+	}
 }
 
 // AC-14: provider 差异封装在 provider 实现和专属选项中，不回流核心抽象。

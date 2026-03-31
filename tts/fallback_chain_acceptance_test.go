@@ -26,25 +26,40 @@ func (p *fallbackTestProvider) Name() string {
 	return p.name
 }
 
-func (p *fallbackTestProvider) Synthesize(ctx context.Context, opts string) ([]byte, error) {
+func (p *fallbackTestProvider) Capabilities() tts.ProviderCapabilities {
+	return tts.ProviderCapabilities{
+		SupportedFormats:     []string{tts.AudioFormatMP3},
+		PreferredAudioFormat: tts.AudioFormatMP3,
+	}
+}
+
+func (p *fallbackTestProvider) Synthesize(ctx context.Context, req tts.SynthesisRequest) (*tts.SynthesisResult, error) {
 	p.called++
 	if p.synthFn == nil {
 		return nil, errors.New("synthesize not implemented")
 	}
-	return p.synthFn(ctx, opts)
+	audio, err := p.synthFn(ctx, req.Text)
+	if err != nil {
+		return nil, err
+	}
+	return &tts.SynthesisResult{Audio: audio, Format: tts.AudioFormatMP3, Provider: p.name, VoiceID: req.VoiceID}, nil
 }
 
-func (p *fallbackTestProvider) SynthesizeStream(context.Context, string) (tts.AudioStream, error) {
+func (p *fallbackTestProvider) SynthesizeStream(context.Context, tts.SynthesisRequest) (tts.AudioStream, error) {
 	return nil, io.EOF
 }
 
-func (p *fallbackTestProvider) ListVoices(context.Context, string) ([]tts.Voice, error) {
+func (p *fallbackTestProvider) ListVoices(context.Context, tts.VoiceFilter) ([]tts.Voice, error) {
 	return nil, nil
 }
 
 func (p *fallbackTestProvider) IsAvailable(context.Context) bool {
 	p.availCall++
 	return p.available
+}
+
+func plainTextRequest(text string) tts.SynthesisRequest {
+	return tts.SynthesisRequest{InputMode: tts.InputModePlainText, Text: text}
 }
 
 func TestProviderFallbackChain_PrimaryFailSecondarySuccess(t *testing.T) {
@@ -64,12 +79,12 @@ func TestProviderFallbackChain_PrimaryFailSecondarySuccess(t *testing.T) {
 		},
 	}
 
-	audio, err := tts.SynthesizeWithFallback(context.Background(), "hello", primary, secondary)
+	result, err := tts.SynthesizeWithFallback(context.Background(), plainTextRequest("hello"), primary, secondary)
 	if err != nil {
 		t.Fatalf("SynthesizeWithFallback() error = %v", err)
 	}
-	if string(audio) != "secondary audio" {
-		t.Fatalf("SynthesizeWithFallback() got audio %q, want %q", string(audio), "secondary audio")
+	if string(result.Audio) != "secondary audio" {
+		t.Fatalf("SynthesizeWithFallback() got audio %q, want %q", string(result.Audio), "secondary audio")
 	}
 	if primary.called != 1 {
 		t.Fatalf("primary called %d times, want 1", primary.called)
@@ -97,7 +112,7 @@ func TestProviderFallbackChain_AllProvidersFail_ReturnsError(t *testing.T) {
 		},
 	}
 
-	_, err := tts.SynthesizeWithFallback(context.Background(), "hello", primary, secondary)
+	_, err := tts.SynthesizeWithFallback(context.Background(), plainTextRequest("hello"), primary, secondary)
 	if err == nil {
 		t.Fatal("SynthesizeWithFallback() error = nil, want aggregated error")
 	}
@@ -139,12 +154,12 @@ func TestProviderFallbackChain_DoesNotPreflightAvailability(t *testing.T) {
 		},
 	}
 
-	audio, err := tts.SynthesizeWithFallback(context.Background(), "hello", primary, secondary)
+	result, err := tts.SynthesizeWithFallback(context.Background(), plainTextRequest("hello"), primary, secondary)
 	if err != nil {
 		t.Fatalf("SynthesizeWithFallback() error = %v", err)
 	}
-	if string(audio) != "primary audio" {
-		t.Fatalf("audio = %q, want %q", string(audio), "primary audio")
+	if string(result.Audio) != "primary audio" {
+		t.Fatalf("audio = %q, want %q", string(result.Audio), "primary audio")
 	}
 	if primary.availCall != 0 {
 		t.Fatalf("primary IsAvailable called %d times, want 0", primary.availCall)
@@ -177,7 +192,7 @@ func TestProviderFallbackChain_ContextCanceledBeforeFirstProvider(t *testing.T) 
 		},
 	}
 
-	_, err := tts.SynthesizeWithFallback(ctx, "hello", primary, secondary)
+	_, err := tts.SynthesizeWithFallback(ctx, plainTextRequest("hello"), primary, secondary)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("SynthesizeWithFallback() error = %v, want %v", err, context.Canceled)
 	}
@@ -205,12 +220,12 @@ func TestProviderFallbackChain_NilContextUsesBackground(t *testing.T) {
 		},
 	}
 
-	audio, err := tts.SynthesizeWithFallback[string](nilContextForFallbackTest(), "hello", primary)
+	result, err := tts.SynthesizeWithFallback(nilContextForFallbackTest(), plainTextRequest("hello"), primary)
 	if err != nil {
 		t.Fatalf("SynthesizeWithFallback() error = %v", err)
 	}
-	if string(audio) != "primary audio" {
-		t.Fatalf("audio = %q, want %q", string(audio), "primary audio")
+	if string(result.Audio) != "primary audio" {
+		t.Fatalf("audio = %q, want %q", string(result.Audio), "primary audio")
 	}
 	if primary.called != 1 {
 		t.Fatalf("primary called %d times, want 1", primary.called)
@@ -235,7 +250,7 @@ func TestProviderFallbackChain_ContextCanceledBetweenProviders(t *testing.T) {
 		},
 	}
 
-	_, err := tts.SynthesizeWithFallback(ctx, "hello", primary, secondary)
+	_, err := tts.SynthesizeWithFallback(ctx, plainTextRequest("hello"), primary, secondary)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("SynthesizeWithFallback() error = %v, want %v", err, context.Canceled)
 	}

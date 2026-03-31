@@ -40,14 +40,20 @@ type translateResponse struct {
 	} `json:"audio"`
 }
 
+type debugHTTPResponse struct {
+	StatusCode int
+	Status     string
+	Header     http.Header
+}
+
 func main() {
 	// 命令行参数
 	text := flag.String("text", "你好，这是一个测试。", "要合成的文本")
-	voice := flag.String("voice", "zh_female_zhubo", "语音ID")
+	voice := flag.String("voice", "BV700_streaming", "语音ID")
 	listVoices := flag.Bool("list", false, "列出所有可用的语音")
 	testAPI := flag.Bool("test", false, "测试 API 可用性")
 	verbose := flag.Bool("verbose", false, "显示详细的 HTTP 交互信息")
-	saveAudio := flag.String("save", "", "保存音频到文件 (例如: output.mp3)")
+	saveAudio := flag.String("save", "", "保存音频到文件 (例如: output.wav)")
 
 	flag.Parse()
 
@@ -90,8 +96,8 @@ func printAllVoices() {
 
 	fmt.Println("\n" + strings.Repeat("=", 80))
 	fmt.Println("使用示例:")
-	fmt.Println("  go run main.go -text \"你好\" -voice zh_female_zhubo")
-	fmt.Println("  go run main.go -text \"Hello\" -voice en_male_adam")
+	fmt.Println("  go run main.go -text \"你好\" -voice BV700_streaming")
+	fmt.Println("  go run main.go -text \"Hello\" -voice BV504_streaming")
 	fmt.Println("=" + strings.Repeat("=", 79))
 }
 
@@ -106,9 +112,9 @@ func testAPIAvailability() {
 		text  string
 		voice string
 	}{
-		{"测试", "zh_female_zhubo"},
-		{"Hello", "en_male_adam"},
-		{"こんにちは", "ja_female_risa"},
+		{"测试", "BV700_streaming"},
+		{"Hello", "BV504_streaming"},
+		{"こんにちは", "BV522_streaming"},
 	}
 
 	for _, tc := range testCases {
@@ -117,12 +123,13 @@ func testAPIAvailability() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		opts := &volcengine.SynthesizeOptions{
-			Text:  tc.text,
-			Voice: tc.voice,
+		request := tts.SynthesisRequest{
+			InputMode: tts.InputModePlainText,
+			Text:      tc.text,
+			VoiceID:   tc.voice,
 		}
 
-		_, err := provider.Synthesize(ctx, opts)
+		_, err := provider.Synthesize(ctx, request)
 		if err != nil {
 			fmt.Printf("❌ 失败: %v\n", err)
 		} else {
@@ -134,14 +141,25 @@ func testAPIAvailability() {
 }
 
 func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
+	printDebugBanner()
+	payload := mustMarshalDebugRequest(text, voice)
+	printDebugRequestInfo(payload)
+	req := mustNewDebugHTTPRequest(payload)
+	printVerboseDebugRequest(req, verbose)
+	resp, body := executeDebugHTTPRequest(req)
+	apiResp := printDebugResponse(resp, body, verbose)
+	printDebugResponseSummary(apiResp, saveAudioPath)
+	fmt.Println("=" + strings.Repeat("=", 79))
+}
+
+func printDebugBanner() {
 	fmt.Println("=" + strings.Repeat("=", 79))
 	fmt.Println("火山翻译 API 请求调试工具")
 	fmt.Println("=" + strings.Repeat("=", 79))
+}
 
-	// 转换语音 ID 到 speaker
+func mustMarshalDebugRequest(text, voice string) []byte {
 	speaker := convertVoiceToSpeaker(voice)
-
-	// 构造请求
 	reqData := translateRequest{
 		Text:    text,
 		Speaker: speaker,
@@ -149,11 +167,12 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 
 	payload, err := json.Marshal(reqData)
 	if err != nil {
-		fmt.Printf("❌ 序列化请求失败: %v\n", err)
-		os.Exit(1)
+		fatalf("❌ 序列化请求失败: %v\n", err)
 	}
+	return payload
+}
 
-	// 打印请求信息
+func printDebugRequestInfo(payload []byte) {
 	fmt.Println("\n【请求信息】")
 	fmt.Println("URL:", defaultAPIURL)
 	fmt.Println("Method: POST")
@@ -169,35 +188,41 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 	} else {
 		fmt.Println(prettyJSON.String())
 	}
+}
 
-	// 创建 HTTP 请求
+func mustNewDebugHTTPRequest(payload []byte) *http.Request {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, defaultAPIURL, bytes.NewReader(payload))
 	if err != nil {
-		fmt.Printf("❌ 创建请求失败: %v\n", err)
-		os.Exit(1)
+		fatalf("❌ 创建请求失败: %v\n", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", defaultUserAgent)
+	return req
+}
 
-	// 如果需要详细信息，打印完整的 HTTP 请求
-	if verbose {
-		fmt.Println("\n【完整 HTTP 请求报文】")
-		requestDump, err := httputil.DumpRequestOut(req, true)
-		if err != nil {
-			fmt.Printf("无法导出请求: %v\n", err)
-		} else {
-			fmt.Println(string(requestDump))
-		}
+func printVerboseDebugRequest(req *http.Request, verbose bool) {
+	if !verbose {
+		return
 	}
 
+	fmt.Println("\n【完整 HTTP 请求报文】")
+	requestDump, err := httputil.DumpRequestOut(req, true)
+	if err != nil {
+		fmt.Printf("无法导出请求: %v\n", err)
+		return
+	}
+	fmt.Println(string(requestDump))
+}
+
+func executeDebugHTTPRequest(req *http.Request) (debugHTTPResponse, []byte) {
 	fmt.Println("\n正在发送请求...")
 	client := &http.Client{Timeout: 30 * time.Second}
+	//nolint:gosec // This debug helper only targets the fixed Volcengine endpoint wired through defaultAPIURL.
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("❌ 发送请求失败: %v\n", err)
-		os.Exit(1)
+		fatalf("❌ 发送请求失败: %v\n", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -205,11 +230,16 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("❌ 读取响应失败: %v\n", err)
-		os.Exit(1)
+		fatalf("❌ 读取响应失败: %v\n", err)
 	}
+	return debugHTTPResponse{
+		StatusCode: resp.StatusCode,
+		Status:     resp.Status,
+		Header:     resp.Header.Clone(),
+	}, body
+}
 
-	// 打印响应信息
+func printDebugResponse(resp debugHTTPResponse, body []byte, verbose bool) translateResponse {
 	fmt.Println("\n" + strings.Repeat("-", 80))
 	fmt.Println("【响应信息】")
 	fmt.Printf("Status: %d %s\n", resp.StatusCode, resp.Status)
@@ -226,19 +256,18 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 	fmt.Println("\n响应 Body (原始 JSON):")
 	fmt.Println(string(body))
 
-	// 解析响应
 	var apiResp translateResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		fmt.Printf("\n❌ 解析响应 JSON 失败: %v\n", err)
-		os.Exit(1)
+		fatalf("\n❌ 解析响应 JSON 失败: %v\n", err)
 	}
 
-	// 格式化打印
 	fmt.Println("\n响应 Body (格式化 JSON):")
 	prettyResp, _ := json.MarshalIndent(apiResp, "", "  ")
 	fmt.Println(string(prettyResp))
+	return apiResp
+}
 
-	// 打印关键信息
+func printDebugResponseSummary(apiResp translateResponse, saveAudioPath string) {
 	fmt.Println("\n" + strings.Repeat("-", 80))
 	fmt.Println("【关键信息】")
 	fmt.Printf("状态码: %d\n", apiResp.BaseResp.StatusCode)
@@ -250,35 +279,48 @@ func debugRequest(text, voice string, verbose bool, saveAudioPath string) {
 			float64(apiResp.Audio.Duration)/1000)
 		fmt.Printf("音频数据长度 (Base64): %d 字符\n", len(apiResp.Audio.Data))
 
-		// 解码音频数据
 		if apiResp.Audio.Data != "" {
-			audioData, err := base64.StdEncoding.DecodeString(apiResp.Audio.Data)
-			if err != nil {
-				fmt.Printf("❌ 解码音频数据失败: %v\n", err)
-			} else {
+			audioData, ok := decodeDebugAudio(apiResp.Audio.Data)
+			if ok {
 				fmt.Printf("音频数据大小 (解码后): %d 字节 (%.2f KB)\n",
 					len(audioData),
 					float64(len(audioData))/1024)
-
-				// 保存音频文件
-				if saveAudioPath != "" {
-					if err := os.WriteFile(saveAudioPath, audioData, 0644); err != nil {
-						fmt.Printf("❌ 保存音频文件失败: %v\n", err)
-					} else {
-						fmt.Printf("✓ 音频已保存到: %s\n", saveAudioPath)
-					}
-				}
+				saveDebugAudio(saveAudioPath, audioData)
 			}
 		}
 
 		fmt.Println("\n✓ 请求成功!")
-	} else {
-		fmt.Printf("\n❌ API 返回错误: code=%d, message=%s\n",
-			apiResp.BaseResp.StatusCode,
-			apiResp.BaseResp.StatusMessage)
+		return
 	}
 
-	fmt.Println("=" + strings.Repeat("=", 79))
+	fmt.Printf("\n❌ API 返回错误: code=%d, message=%s\n",
+		apiResp.BaseResp.StatusCode,
+		apiResp.BaseResp.StatusMessage)
+}
+
+func decodeDebugAudio(encoded string) ([]byte, bool) {
+	audioData, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		fmt.Printf("❌ 解码音频数据失败: %v\n", err)
+		return nil, false
+	}
+	return audioData, true
+}
+
+func saveDebugAudio(path string, audioData []byte) {
+	if path == "" {
+		return
+	}
+	if err := os.WriteFile(path, audioData, 0o600); err != nil {
+		fmt.Printf("❌ 保存音频文件失败: %v\n", err)
+		return
+	}
+	fmt.Printf("✓ 音频已保存到: %s\n", path)
+}
+
+func fatalf(format string, args ...interface{}) {
+	fmt.Printf(format, args...)
+	os.Exit(1)
 }
 
 func convertVoiceToSpeaker(voice string) string {

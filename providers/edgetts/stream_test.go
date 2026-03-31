@@ -23,7 +23,7 @@ func TestEdgeAudioStream_AlreadyClosed(t *testing.T) {
 	}
 
 	_, err := stream.Read()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Errorf("Expected io.EOF for closed stream, got %v", err)
 	}
 }
@@ -34,12 +34,12 @@ func TestEdgeAudioStream_EmptyChunks(t *testing.T) {
 		ctx:        context.Background(),
 		textChunks: []string{},
 		chunkIndex: 0,
-		opts:       &SynthesizeOptions{},
+		opts:       &synthesizeOptions{},
 		provider:   &Provider{maxAttempts: 1, receiveTimeout: time.Second},
 	}
 
 	_, err := stream.Read()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Errorf("Expected io.EOF for empty chunks, got %v", err)
 	}
 	if !stream.closed {
@@ -56,7 +56,7 @@ func TestEdgeAudioStream_ContextCancellation(t *testing.T) {
 		ctx:        ctx,
 		textChunks: []string{"test"},
 		chunkIndex: 0,
-		opts:       &SynthesizeOptions{},
+		opts:       &synthesizeOptions{},
 		provider:   &Provider{maxAttempts: 1, receiveTimeout: time.Second},
 	}
 
@@ -146,14 +146,14 @@ func TestEdgeAudioStream_ChunkIndexBoundary(t *testing.T) {
 				ctx:        context.Background(),
 				textChunks: tt.textChunks,
 				chunkIndex: tt.chunkIndex,
-				opts:       &SynthesizeOptions{},
+				opts:       &synthesizeOptions{},
 				provider:   &Provider{maxAttempts: 1, receiveTimeout: time.Millisecond * 100},
 			}
 
 			_, err := stream.Read()
 
 			if tt.expectEOF {
-				if err != io.EOF {
+				if !errors.Is(err, io.EOF) {
 					t.Errorf("Expected io.EOF, got %v", err)
 				}
 			}
@@ -290,7 +290,7 @@ func TestClassifyWebsocketReadError(t *testing.T) {
 
 			if tt.expectedCode == "" {
 				// 应该是父context错误
-				if err != tt.parentCtxErr {
+				if !errors.Is(err, tt.parentCtxErr) {
 					t.Errorf("Expected parent context error, got %v", err)
 				}
 				if retryable := tts.IsRetryableError(err); retryable != tt.expectRetry {
@@ -412,7 +412,7 @@ func TestEdgeAudioStream_TurnEndWithoutAudioReturnsExplicitError(t *testing.T) {
 		ctx:        context.Background(),
 		textChunks: []string{"chunk1"},
 		chunkIndex: 0,
-		opts:       &SynthesizeOptions{},
+		opts:       &synthesizeOptions{},
 		provider:   &Provider{maxAttempts: 1, receiveTimeout: time.Second},
 		conn:       conn,
 	}
@@ -445,7 +445,7 @@ func TestEdgeAudioStream_MetadataEmissionReturnsExplicitFailure(t *testing.T) {
 		ctx:        context.Background(),
 		textChunks: []string{"chunk1"},
 		chunkIndex: 0,
-		opts: &SynthesizeOptions{BoundaryCallback: func(tts.BoundaryEvent) {
+		opts: &synthesizeOptions{BoundaryCallback: func(tts.BoundaryEvent) {
 			callbackCount++
 		}},
 		provider: &Provider{maxAttempts: 2, receiveTimeout: time.Second},
@@ -513,7 +513,7 @@ func TestEdgeAudioStream_DoesNotReplayCommittedChunkAfterNextChunkInitRetry(t *t
 	stream := &edgeAudioStream{
 		ctx:        ctx,
 		textChunks: []string{"chunk-0", "chunk-1"},
-		opts: &SynthesizeOptions{
+		opts: &synthesizeOptions{
 			Voice: defaultVoice,
 		},
 		provider: provider,
@@ -539,7 +539,7 @@ func TestEdgeAudioStream_DoesNotReplayCommittedChunkAfterNextChunkInitRetry(t *t
 	}
 
 	_, err = stream.Read()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("final Read() error = %v; want io.EOF", err)
 	}
 }
@@ -548,12 +548,12 @@ func TestEdgeAudioStream_DoesNotReplayCommittedChunkAfterNextChunkInitRetry(t *t
 func TestBuildSSML(t *testing.T) {
 	tests := []struct {
 		name     string
-		opts     *SynthesizeOptions
+		opts     *synthesizeOptions
 		contains []string
 	}{
 		{
 			name: "基本选项",
-			opts: &SynthesizeOptions{
+			opts: &synthesizeOptions{
 				Text:   "Hello World",
 				Voice:  "en-US-JennyNeural",
 				Rate:   1.0,
@@ -571,7 +571,7 @@ func TestBuildSSML(t *testing.T) {
 		},
 		{
 			name: "空Voice使用默认",
-			opts: &SynthesizeOptions{
+			opts: &synthesizeOptions{
 				Text: "测试",
 			},
 			contains: []string{
@@ -581,7 +581,7 @@ func TestBuildSSML(t *testing.T) {
 		},
 		{
 			name: "调整语速和音量",
-			opts: &SynthesizeOptions{
+			opts: &synthesizeOptions{
 				Text:   "Fast and loud",
 				Voice:  "en-US-GuyNeural",
 				Rate:   1.5,
@@ -637,7 +637,10 @@ func newTestWebsocketConn(t *testing.T, handler func(context.Context, *websocket
 	t.Cleanup(server.Close)
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.Dial(context.Background(), wsURL, nil)
+	conn, resp, err := websocket.Dial(context.Background(), wsURL, nil)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if err != nil {
 		t.Fatalf("websocket dial failed: %v", err)
 	}

@@ -19,6 +19,27 @@ func testVoices() []Voice {
 	}
 }
 
+func testVoiceFilter(language string) VoiceFilter {
+	if language == "" {
+		return VoiceFilter{}
+	}
+	return VoiceFilter{Language: language}
+}
+
+func mustNewVoiceCache(t *testing.T, fetcher func(ctx context.Context) ([]Voice, error), opts ...VoiceCacheOption) *VoiceCache {
+	t.Helper()
+	cache, err := NewVoiceCache(fetcher, opts...)
+	if err != nil {
+		t.Fatalf("NewVoiceCache: unexpected error: %v", err)
+	}
+	return cache
+}
+
+func nilContextForVoiceCacheTest() context.Context {
+	var ctx context.Context
+	return ctx
+}
+
 func TestVoiceCache_FirstFetch(t *testing.T) {
 	var calls atomic.Int32
 	fetcher := func(ctx context.Context) ([]Voice, error) {
@@ -26,8 +47,8 @@ func TestVoiceCache_FirstFetch(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
-	voices, err := cache.Get(context.Background(), "")
+	cache := mustNewVoiceCache(t, fetcher)
+	voices, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -46,16 +67,16 @@ func TestVoiceCache_CacheHit(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	// First call populates cache
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Second call should hit cache
-	voices, err := cache.Get(context.Background(), "")
+	voices, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -74,10 +95,10 @@ func TestVoiceCache_TTLExpiry(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher, WithTTL(20*time.Millisecond))
+	cache := mustNewVoiceCache(t, fetcher, WithTTL(20*time.Millisecond))
 
 	// First call
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -89,7 +110,7 @@ func TestVoiceCache_TTLExpiry(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	// Should trigger re-fetch
-	_, err = cache.Get(context.Background(), "")
+	_, err = cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -105,9 +126,9 @@ func TestVoiceCache_EmptyFetchIsCachedUntilTTLExpiry(t *testing.T) {
 		return []Voice{}, nil
 	}
 
-	cache := NewVoiceCache(fetcher, WithTTL(20*time.Millisecond))
+	cache := mustNewVoiceCache(t, fetcher, WithTTL(20*time.Millisecond))
 
-	voices, err := cache.Get(context.Background(), "")
+	voices, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("first Get() error: %v", err)
 	}
@@ -118,7 +139,7 @@ func TestVoiceCache_EmptyFetchIsCachedUntilTTLExpiry(t *testing.T) {
 		t.Fatalf("fetcher called %d times after first Get, want 1", calls.Load())
 	}
 
-	voices, err = cache.Get(context.Background(), "")
+	voices, err = cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("second Get() error: %v", err)
 	}
@@ -131,7 +152,7 @@ func TestVoiceCache_EmptyFetchIsCachedUntilTTLExpiry(t *testing.T) {
 
 	time.Sleep(30 * time.Millisecond)
 
-	voices, err = cache.Get(context.Background(), "")
+	voices, err = cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("third Get() after TTL expiry error: %v", err)
 	}
@@ -154,10 +175,10 @@ func TestVoiceCache_StaleOnError(t *testing.T) {
 		return nil, fetchErr
 	}
 
-	cache := NewVoiceCache(fetcher, WithTTL(10*time.Millisecond))
+	cache := mustNewVoiceCache(t, fetcher, WithTTL(10*time.Millisecond))
 
 	// First call succeeds
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -166,7 +187,7 @@ func TestVoiceCache_StaleOnError(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// Second call fails but should return stale data
-	voices, err := cache.Get(context.Background(), "")
+	voices, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("expected nil error with stale data, got: %v", err)
 	}
@@ -181,9 +202,9 @@ func TestVoiceCache_NoDataOnError(t *testing.T) {
 		return nil, fetchErr
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err == nil {
 		t.Fatal("expected error when no data and fetch fails")
 	}
@@ -192,12 +213,33 @@ func TestVoiceCache_NoDataOnError(t *testing.T) {
 	}
 }
 
+func TestVoiceCache_NilContextUsesBackground(t *testing.T) {
+	var fetchCtx context.Context
+	fetcher := func(ctx context.Context) ([]Voice, error) {
+		fetchCtx = ctx
+		return testVoices(), nil
+	}
+
+	cache := mustNewVoiceCache(t, fetcher)
+
+	voices, err := cache.Get(nilContextForVoiceCacheTest(), testVoiceFilter(""))
+	if err != nil {
+		t.Fatalf("Get(nilContextForVoiceCacheTest(), ...) error: %v", err)
+	}
+	if len(voices) != 4 {
+		t.Fatalf("Get(nilContextForVoiceCacheTest(), ...) returned %d voices, want 4", len(voices))
+	}
+	if fetchCtx == nil {
+		t.Fatal("fetcher received nil context")
+	}
+}
+
 func TestVoiceCache_LocaleFilter(t *testing.T) {
 	fetcher := func(ctx context.Context) ([]Voice, error) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	tests := []struct {
 		name     string
@@ -216,7 +258,7 @@ func TestVoiceCache_LocaleFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			voices, err := cache.Get(context.Background(), tt.locale)
+			voices, err := cache.Get(context.Background(), testVoiceFilter(tt.locale))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -232,11 +274,11 @@ func TestVoiceCache_LocaleFilterRejectsInvalidLocalePrefixes(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	for _, locale := range []string{"e", "z", "en-", "zh-"} {
 		t.Run(locale, func(t *testing.T) {
-			voices, err := cache.Get(context.Background(), locale)
+			voices, err := cache.Get(context.Background(), testVoiceFilter(locale))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -252,13 +294,13 @@ func TestVoiceCache_LocaleFilterMatchesSupportsLanguageSemantics(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 	voices := testVoices()
 	locales := []string{"zh", "zh-CN", "en", "en-US", "ja", "ja-JP", "e", "en-", "zh-", "fr-FR"}
 
 	for _, locale := range locales {
 		t.Run(locale, func(t *testing.T) {
-			got, err := cache.Get(context.Background(), locale)
+			got, err := cache.Get(context.Background(), testVoiceFilter(locale))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -290,7 +332,7 @@ func TestVoiceCache_ConcurrentAccess(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 20)
@@ -298,7 +340,7 @@ func TestVoiceCache_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			voices, err := cache.Get(context.Background(), "")
+			voices, err := cache.Get(context.Background(), testVoiceFilter(""))
 			if err != nil {
 				errs <- err
 				return
@@ -329,7 +371,7 @@ func TestVoiceCache_BackgroundRefresh(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher, WithTTL(time.Hour), WithBackgroundRefresh(20*time.Millisecond))
+	cache := mustNewVoiceCache(t, fetcher, WithTTL(time.Hour), WithBackgroundRefresh(20*time.Millisecond))
 	t.Cleanup(func() {
 		if err := cache.Stop(); err != nil {
 			t.Fatalf("Stop() error: %v", err)
@@ -337,7 +379,7 @@ func TestVoiceCache_BackgroundRefresh(t *testing.T) {
 	})
 
 	// First call to populate
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -357,10 +399,10 @@ func TestVoiceCache_Stop(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher, WithBackgroundRefresh(10*time.Millisecond))
+	cache := mustNewVoiceCache(t, fetcher, WithBackgroundRefresh(10*time.Millisecond))
 
 	// Populate cache
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -385,8 +427,8 @@ func TestVoiceCache_StopIdempotent(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher, WithBackgroundRefresh(10*time.Millisecond))
-	_, _ = cache.Get(context.Background(), "")
+	cache := mustNewVoiceCache(t, fetcher, WithBackgroundRefresh(10*time.Millisecond))
+	_, _ = cache.Get(context.Background(), testVoiceFilter(""))
 
 	// Multiple Stop calls should not panic
 	if err := cache.Stop(); err != nil {
@@ -402,7 +444,7 @@ func TestVoiceCache_StopWithoutBackgroundRefresh(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	// Stop on a cache without background refresh should not panic
 	if err := cache.Stop(); err != nil {
@@ -423,7 +465,7 @@ func TestVoiceCache_Stop_ReturnsErrorWhenBackgroundFetcherIgnoresCancel(t *testi
 		return nil, nil
 	}
 
-	cache := NewVoiceCache(fetcher, WithBackgroundRefresh(10*time.Millisecond))
+	cache := mustNewVoiceCache(t, fetcher, WithBackgroundRefresh(10*time.Millisecond))
 	t.Cleanup(func() {
 		close(hang)
 		select {
@@ -456,19 +498,17 @@ func TestVoiceCache_Stop_ReturnsErrorWhenBackgroundFetcherIgnoresCancel(t *testi
 	}
 }
 
-func TestNewVoiceCache_NilFetcherPanics(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for nil fetcher, got none")
-		}
-		msg, ok := r.(string)
-		if !ok || msg != "tts: VoiceCache fetcher must not be nil" {
-			t.Errorf("unexpected panic message: %v", r)
-		}
-	}()
-
-	NewVoiceCache(nil)
+func TestNewVoiceCache_NilFetcherReturnsError(t *testing.T) {
+	cache, err := NewVoiceCache(nil)
+	if err == nil {
+		t.Fatal("expected error for nil fetcher, got nil")
+	}
+	if cache != nil {
+		t.Fatal("expected nil cache for nil fetcher")
+	}
+	if !errors.Is(err, ErrNilVoiceCacheFetcher) {
+		t.Errorf("expected ErrNilVoiceCacheFetcher, got: %v", err)
+	}
 }
 
 func TestWithTTL_IgnoresNonPositive(t *testing.T) {
@@ -476,12 +516,12 @@ func TestWithTTL_IgnoresNonPositive(t *testing.T) {
 		return testVoices(), nil
 	}
 
-	cacheZero := NewVoiceCache(fetcher, WithTTL(0))
+	cacheZero := mustNewVoiceCache(t, fetcher, WithTTL(0))
 	if cacheZero.ttl != defaultVoiceCacheTTL {
 		t.Errorf("ttl = %v, want default %v for zero input", cacheZero.ttl, defaultVoiceCacheTTL)
 	}
 
-	cacheNegative := NewVoiceCache(fetcher, WithTTL(-1*time.Second))
+	cacheNegative := mustNewVoiceCache(t, fetcher, WithTTL(-1*time.Second))
 	if cacheNegative.ttl != defaultVoiceCacheTTL {
 		t.Errorf("ttl = %v, want default %v for negative input", cacheNegative.ttl, defaultVoiceCacheTTL)
 	}
@@ -494,7 +534,7 @@ func TestDefaultVoiceCacheTTL_Is24Hours(t *testing.T) {
 }
 
 func TestNewVoiceCache_DefaultTTLIs24Hours(t *testing.T) {
-	cache := NewVoiceCache(func(ctx context.Context) ([]Voice, error) {
+	cache := mustNewVoiceCache(t, func(ctx context.Context) ([]Voice, error) {
 		return testVoices(), nil
 	})
 
@@ -507,7 +547,7 @@ func TestVoiceCache_FindCached_Empty(t *testing.T) {
 	fetcher := func(ctx context.Context) ([]Voice, error) {
 		return testVoices(), nil
 	}
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	// Before any Get, cache is empty
 	_, ok := cache.FindCached("zh-CN-XiaoxiaoNeural")
@@ -520,10 +560,10 @@ func TestVoiceCache_FindCached_Hit(t *testing.T) {
 	fetcher := func(ctx context.Context) ([]Voice, error) {
 		return testVoices(), nil
 	}
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	// Populate cache
-	_, err := cache.Get(context.Background(), "")
+	_, err := cache.Get(context.Background(), testVoiceFilter(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -553,11 +593,11 @@ func TestVoiceCache_ReturnsDeepCopies(t *testing.T) {
 		},
 	}
 
-	cache := NewVoiceCache(func(ctx context.Context) ([]Voice, error) {
+	cache := mustNewVoiceCache(t, func(ctx context.Context) ([]Voice, error) {
 		return voicesWithExtra, nil
 	})
 
-	got, err := cache.Get(context.Background(), "zh")
+	got, err := cache.Get(context.Background(), testVoiceFilter("zh"))
 	if err != nil {
 		t.Fatalf("Get() error: %v", err)
 	}
@@ -573,7 +613,7 @@ func TestVoiceCache_ReturnsDeepCopies(t *testing.T) {
 	extra.Status = "Preview"
 	extra.Styles[0] = "sad"
 
-	again, err := cache.Get(context.Background(), "zh")
+	again, err := cache.Get(context.Background(), testVoiceFilter("zh"))
 	if err != nil {
 		t.Fatalf("second Get() error: %v", err)
 	}
@@ -618,10 +658,10 @@ func TestVoiceCache_FindCached_Miss(t *testing.T) {
 	fetcher := func(ctx context.Context) ([]Voice, error) {
 		return testVoices(), nil
 	}
-	cache := NewVoiceCache(fetcher)
+	cache := mustNewVoiceCache(t, fetcher)
 
 	// Populate cache
-	_, _ = cache.Get(context.Background(), "")
+	_, _ = cache.Get(context.Background(), testVoiceFilter(""))
 
 	_, ok := cache.FindCached("nonexistent-voice")
 	if ok {

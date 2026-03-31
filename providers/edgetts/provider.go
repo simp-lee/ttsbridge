@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -15,22 +16,21 @@ import (
 	"github.com/simp-lee/ttsbridge/tts/textutils"
 )
 
-// SynthesizeOptions EdgeTTS synthesis options
-type SynthesizeOptions struct {
+// synthesizeOptions stores provider-native EdgeTTS request fields.
+type synthesizeOptions struct {
 	Text  string
 	Voice string
 
-	Rate   float64 // Speech rate, 0.5-2.0, default 1.0
-	Volume float64 // Volume, 0.0-1.0, default 1.0
-	Pitch  float64 // Pitch, 0.5-2.0, default 1.0
+	Rate   float64 // Speech rate multiplier, default 1.0.
+	Volume float64 // Volume multiplier, default 1.0. Explicit 0.0 means mute.
+	Pitch  float64 // Pitch multiplier, default 1.0.
 
 	WordBoundaryEnabled     bool
 	SentenceBoundaryEnabled bool
 
 	// OutputFormat Edge TTS 输出格式字符串，如 "audio-48khz-192kbitrate-mono-mp3"。
 	// 不设置时使用 Provider 默认格式（MP3 24kHz 48kbps）。
-	// 可通过 provider.OutputOptions() 查看推荐格式目录；仅已声明且 probe 成功
-	// 的格式会出现在 provider.SupportedFormats() 中。未知格式、未声明格式或
+	// 仅已声明且 probe 成功的格式会出现在 provider.SupportedFormats() 中。未知格式、未声明格式或
 	// 已探测为不可用的格式会在本地发送前被拒绝。
 	OutputFormat string
 
@@ -50,16 +50,18 @@ type Provider struct {
 	voiceCache     *tts.VoiceCache
 	formatRegistry *tts.FormatRegistry
 	connectHook    func(context.Context) (*websocket.Conn, error)
+	clockSkewMu    sync.RWMutex
+	clockSkewSecs  float64
 }
 
-var _ tts.Provider[*SynthesizeOptions] = (*Provider)(nil)
+var _ tts.Provider = (*Provider)(nil)
 
 // New creates Edge TTS provider with default settings
 // Use With* methods to customize configuration:
 //
 //	provider := edgetts.New().
 //	    WithClientToken("your-token").
-//	    WithTimeout(30*time.Second).
+//	    WithHTTPTimeout(30*time.Second).
 //	    WithMaxAttempts(5)
 func New() *Provider {
 	reg := defaultFormatRegistry.Clone()
@@ -108,13 +110,13 @@ func (p *Provider) WithMaxAttempts(attempts int) *Provider {
 }
 
 // WithVoiceCache enables voice list caching. The cache fetches the full
-// voice list once and filters by locale on each ListVoices call.
+// voice list once and applies VoiceFilter on each ListVoices call.
 // Pass VoiceCacheOption values (e.g. tts.WithTTL, tts.WithBackgroundRefresh)
 // to customise cache behaviour.
 func (p *Provider) WithVoiceCache(opts ...tts.VoiceCacheOption) *Provider {
 	fetcher := func(ctx context.Context) ([]tts.Voice, error) {
 		entries, err := retry.DoWithResult(func() ([]voiceListEntry, error) {
-			return fetchVoiceList(ctx, p.client, p.clientToken)
+			return p.fetchVoiceList(ctx)
 		}, tts.RetryOptions(ctx, p.maxAttempts)...)
 		if err != nil {
 			if retry.IsRetryError(err) {
@@ -129,7 +131,7 @@ func (p *Provider) WithVoiceCache(opts ...tts.VoiceCacheOption) *Provider {
 		}
 		return filterAndConvertVoices(entries, ""), nil
 	}
-	p.voiceCache = tts.NewVoiceCache(fetcher, opts...)
+	p.voiceCache, _ = tts.NewVoiceCache(fetcher, opts...) // fetcher is always non-nil
 	return p
 }
 
@@ -249,7 +251,7 @@ func normalizeEdgeTTSContext(ctx context.Context) context.Context {
 	return ctx
 }
 
-func normalizeBoundaryOptions(opts *SynthesizeOptions) *SynthesizeOptions {
+func normalizeBoundaryOptions(opts *synthesizeOptions) *synthesizeOptions {
 	if opts.BoundaryCallback == nil || opts.WordBoundaryEnabled || opts.SentenceBoundaryEnabled {
 		return opts
 	}
@@ -258,7 +260,7 @@ func normalizeBoundaryOptions(opts *SynthesizeOptions) *SynthesizeOptions {
 	return &optsCopy
 }
 
-func splitPreparedText(opts *SynthesizeOptions) ([]string, error) {
+func splitPreparedText(opts *synthesizeOptions) ([]string, error) {
 	preparedText := textutils.PrepareSSMLText(opts.Text)
 	if preparedText == "" {
 		return nil, &tts.Error{Code: tts.ErrCodeInvalidInput, Message: "text cannot be empty after text normalization", Provider: providerName}
@@ -340,7 +342,7 @@ func (p *Provider) resolveOutputFormatWithMode(requested string, allowUndeclared
 	}
 }
 
-func (p *Provider) synthesizeChunks(ctx context.Context, opts *SynthesizeOptions, textChunks []string, allowUndeclaredProbeFormat bool) ([]byte, error) {
+func (p *Provider) synthesizeChunks(ctx context.Context, opts *synthesizeOptions, textChunks []string, allowUndeclaredProbeFormat bool) ([]byte, error) {
 	var allAudio []byte
 
 	for i, chunk := range textChunks {
@@ -356,7 +358,7 @@ func (p *Provider) synthesizeChunks(ctx context.Context, opts *SynthesizeOptions
 	return allAudio, nil
 }
 
-func (p *Provider) synthesize(ctx context.Context, opts *SynthesizeOptions, allowUndeclaredProbeFormat bool) ([]byte, error) {
+func (p *Provider) synthesize(ctx context.Context, opts *synthesizeOptions, allowUndeclaredProbeFormat bool) ([]byte, error) {
 	if opts == nil {
 		return nil, &tts.Error{Code: tts.ErrCodeInvalidInput, Message: "options cannot be nil", Provider: providerName}
 	}
@@ -378,15 +380,32 @@ func (p *Provider) synthesize(ctx context.Context, opts *SynthesizeOptions, allo
 	return allAudio, nil
 }
 
-// Synthesize synthesizes text to speech
-func (p *Provider) Synthesize(ctx context.Context, opts *SynthesizeOptions) ([]byte, error) {
+// Synthesize synthesizes a provider-neutral request and returns metadata-rich output.
+func (p *Provider) Synthesize(ctx context.Context, request tts.SynthesisRequest) (*tts.SynthesisResult, error) {
 	ctx = normalizeEdgeTTSContext(ctx)
-	return p.synthesize(ctx, opts, false)
+	plan, err := p.prepareSynthesis(request)
+	if err != nil {
+		return nil, err
+	}
+
+	var events []tts.BoundaryEvent
+	if request.NeedBoundaryEvents {
+		plan.options.BoundaryCallback = func(event tts.BoundaryEvent) {
+			events = append(events, event)
+		}
+	}
+
+	audio, err := p.synthesize(ctx, plan.options, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.buildResult(audio, plan, events)
 }
 
 // synthesizeChunk synthesizes a single text chunk.
 // Boundary offsets are reported relative to this chunk.
-func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions, text string, chunkIndex int, allowUndeclaredProbeFormat bool) ([]byte, error) {
+func (p *Provider) synthesizeChunk(ctx context.Context, opts *synthesizeOptions, text string, chunkIndex int, allowUndeclaredProbeFormat bool) ([]byte, error) {
 	chunkOpts := *opts
 	chunkOpts.Text = text
 
@@ -398,18 +417,17 @@ func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions,
 		}
 		defer closeNowIgnoreError(conn)
 
-		if err := p.sendConfig(ctx, conn, opts, allowUndeclaredProbeFormat); err != nil {
-			return err
+		if sendConfigErr := p.sendConfig(ctx, conn, opts, allowUndeclaredProbeFormat); sendConfigErr != nil {
+			return sendConfigErr
 		}
 
-		if err := p.sendSSML(ctx, conn, &chunkOpts); err != nil {
-			return err
+		if sendSSMLErr := p.sendSSML(ctx, conn, &chunkOpts); sendSSMLErr != nil {
+			return sendSSMLErr
 		}
 
 		audio, err = p.receiveAudio(ctx, conn, opts, chunkIndex)
 		return err
 	}, tts.RetryOptions(ctx, p.maxAttempts)...)
-
 	if err != nil {
 		if retry.IsRetryError(err) {
 			cause := unwrapRetryCause(err)
@@ -430,39 +448,35 @@ func (p *Provider) synthesizeChunk(ctx context.Context, opts *SynthesizeOptions,
 	return audio, nil
 }
 
-func (p *Provider) synthesizeForProbe(ctx context.Context, opts *SynthesizeOptions) ([]byte, error) {
+func (p *Provider) synthesizeForProbe(ctx context.Context, opts *synthesizeOptions) ([]byte, error) {
 	ctx = normalizeEdgeTTSContext(ctx)
 	return p.synthesize(ctx, opts, true)
 }
 
-// SynthesizeStream returns a streaming audio reader
-func (p *Provider) SynthesizeStream(ctx context.Context, opts *SynthesizeOptions) (tts.AudioStream, error) {
+// SynthesizeStream returns a streaming audio reader.
+func (p *Provider) SynthesizeStream(ctx context.Context, request tts.SynthesisRequest) (tts.AudioStream, error) {
 	ctx = normalizeEdgeTTSContext(ctx)
-	if opts == nil {
-		return nil, &tts.Error{Code: tts.ErrCodeInvalidInput, Message: "options cannot be nil", Provider: providerName}
-	}
-	if opts.Text == "" {
-		return nil, &tts.Error{Code: tts.ErrCodeInvalidInput, Message: "text cannot be empty", Provider: providerName}
-	}
-	if err := p.runtimeConfigError(); err != nil {
+	if err := request.ValidateStreamAgainst(providerName, p.Capabilities()); err != nil {
 		return nil, err
 	}
 
-	// Smart default: enable word boundary when BoundaryCallback is set but no boundary option enabled
-	if opts.BoundaryCallback != nil && !opts.WordBoundaryEnabled && !opts.SentenceBoundaryEnabled {
-		optsCopy := *opts
-		optsCopy.WordBoundaryEnabled = true
-		opts = &optsCopy
+	plan, err := p.prepareSynthesis(request)
+	if err != nil {
+		return nil, err
 	}
 
-	textChunks, err := splitPreparedText(opts)
+	if runtimeErr := p.runtimeConfigError(); runtimeErr != nil {
+		return nil, runtimeErr
+	}
+
+	textChunks, err := splitPreparedText(plan.options)
 	if err != nil {
 		return nil, err
 	}
 
 	return &edgeAudioStream{
 		ctx:        ctx,
-		opts:       opts,
+		opts:       plan.options,
 		provider:   p,
 		textChunks: textChunks,
 		chunkIndex: 0,
